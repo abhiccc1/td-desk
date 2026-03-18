@@ -1,0 +1,138 @@
+x-backend-common: &backend-common
+  env_file:
+    - .env
+  environment:
+    REDIS_URL: redis://redis:6379/0
+    TIMESCALEDB_URL: postgresql+asyncpg://trader:trader@timescaledb:5432/tradingdb
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+  networks:
+    - td-net
+  restart: unless-stopped
+
+services:
+  # --- Infrastructure ---
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+      - ./infra/docker/redis/redis.conf:/usr/local/etc/redis/redis.conf
+    command: redis-server /usr/local/etc/redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - td-net
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-trader}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trader}
+      POSTGRES_DB: ${POSTGRES_DB:-tradingdb}
+    volumes:
+      - tsdb_data:/var/lib/postgresql/data
+      - ./infra/docker/timescaledb/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trader -d tradingdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - td-net
+
+  # --- Backend Microservices ---
+  market_data_service:
+    <<: *backend-common
+    build:
+      context: ./backend
+      dockerfile: market_data_service/Dockerfile
+    volumes:
+      - ./data:/app/data:ro
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      TIMESCALEDB_URL: postgresql+asyncpg://trader:trader@timescaledb:5432/tradingdb
+      NSE_WS_URL: ${NSE_WS_URL:-}
+      MCX_WS_URL: ${MCX_WS_URL:-}
+      BROKER_API_KEY: ${BROKER_API_KEY:-}
+      BROKER_API_SECRET: ${BROKER_API_SECRET:-}
+      KOTAK_CONSUMER_KEY: ${KOTAK_CONSUMER_KEY:-}
+      KOTAK_ENVIRONMENT: ${KOTAK_ENVIRONMENT:-prod}
+      INSTRUMENTS_PATH: /app/data/instruments.json
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  quant_service:
+    <<: *backend-common
+    build:
+      context: ./backend
+      dockerfile: quant_service/Dockerfile
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      TIMESCALEDB_URL: postgresql+asyncpg://trader:trader@timescaledb:5432/tradingdb
+      RISK_FREE_RATE: ${RISK_FREE_RATE:-0.065}
+      GREEKS_BATCH_INTERVAL_MS: ${GREEKS_BATCH_INTERVAL_MS:-100}
+    depends_on:
+      redis:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+
+  order_service:
+    <<: *backend-common
+    build:
+      context: ./backend
+      dockerfile: order_service/Dockerfile
+    ports:
+      - "8001:8000"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      TIMESCALEDB_URL: postgresql+asyncpg://trader:trader@timescaledb:5432/tradingdb
+      BROKER_API_KEY: ${BROKER_API_KEY:-}
+      BROKER_API_SECRET: ${BROKER_API_SECRET:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+
+  api_gateway:
+    <<: *backend-common
+    build:
+      context: ./backend
+      dockerfile: api_gateway/Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data:ro
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      TIMESCALEDB_URL: postgresql+asyncpg://trader:trader@timescaledb:5432/tradingdb
+      ORDER_SERVICE_URL: http://order_service:8000
+      JWT_SECRET: ${JWT_SECRET:-local-dev-secret-change-in-prod}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      KOTAK_CONSUMER_KEY: ${KOTAK_CONSUMER_KEY:-}
+      KOTAK_ENVIRONMENT: ${KOTAK_ENVIRONMENT:-prod}
+      INSTRUMENTS_PATH: /app/data/instruments.json
+    depends_on:
+      redis:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+      order_service:
+        condition: service_started
+
+volumes:
+  redis_data:
+  tsdb_data:
+
+networks:
+  td-net:
+    driver: bridge

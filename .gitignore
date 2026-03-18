@@ -1,0 +1,73 @@
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local tooling state
+.claude/
+.frontend.pid
+*.log
+
+# Environment files
+.env
+**/.env
+.env.*
+**/.env.*
+!.env.example
+!**/.env.example
+!**/.env.*.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.python-version
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+site/
+dist/
+build/
+pip-wheel-metadata/
+*.egg
+*.egg-info/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+.turbo/
+coverage/
+playwright-report/
+test-results/
+.vercel/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Rust / Tauri
+target/
+frontend/src-tauri/gen/schemas/
+
+# Generated caches and binaries
+*.pid
+*.seed
+*.stackdump
+
+# Local data volumes
+data/
