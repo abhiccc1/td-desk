@@ -67,7 +67,7 @@ export function SviAlertBar() {
         <AlertItem key={`${alert.title}-${alert.timestamp}`} alert={alert} index={i} />
       ))}
       {alerts.length > 3 && (
-        <span className="text-center text-[10px] text-[#606070]">
+        <span className="text-center text-[10px] text-panel-subtle">
           +{alerts.length - 3} more alerts
         </span>
       )}

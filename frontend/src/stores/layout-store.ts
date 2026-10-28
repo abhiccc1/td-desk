@@ -24,6 +24,7 @@ interface LayoutState {
 
 interface LayoutActions {
   setLayout: (layout: MosaicNode<PanelId> | null) => void;
+  setRiskWorkspace: () => void;
   addFloatingPanel: (panel: FloatingPanel) => void;
   removeFloatingPanel: (id: PanelId) => void;
   updateFloatingPanel: (id: PanelId, patch: Partial<Omit<FloatingPanel, "id">>) => void;
@@ -102,6 +103,13 @@ export const DEFAULT_LAYOUT: MosaicNode<PanelId> = {
   splitPercentages: [60, 40],
 };
 
+export const RISK_WORKSPACE_LAYOUT: MosaicNode<PanelId> = {
+  type: "split",
+  direction: "row",
+  children: ["risk-management", "positions"],
+  splitPercentages: [50, 50],
+};
+
 export const useLayoutStore = create<LayoutStore>()(
   persist(
     (set) => ({
@@ -111,6 +119,10 @@ export const useLayoutStore = create<LayoutStore>()(
 
       setLayout: (layout: MosaicNode<PanelId> | null) => {
         set({ layout });
+      },
+
+      setRiskWorkspace: () => {
+        set({ layout: RISK_WORKSPACE_LAYOUT, floatingPanels: [] });
       },
 
       addFloatingPanel: (panel: FloatingPanel) => {
@@ -202,10 +214,7 @@ export const useLayoutStore = create<LayoutStore>()(
       merge: (persisted, current) => ({
         ...current,
         ...(persisted as Partial<LayoutStore>),
-        layout: removePanelFromLayout(
-          (persisted as Partial<LayoutState>)?.layout ?? current.layout,
-          "payoff-diagram",
-        ),
+        layout: (persisted as Partial<LayoutState>)?.layout ?? current.layout,
         floatingPanels:
           (persisted as Partial<LayoutState>)?.floatingPanels ?? current.floatingPanels,
         showPanelBar:

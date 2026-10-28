@@ -9,6 +9,12 @@ x-backend-common: &backend-common
     - td-net
   restart: unless-stopped
 
+# Bind-mount the shared library into every backend so host edits take effect
+# without rebuilding (the dev image installs it editable). uvicorn services
+# (api_gateway, order_service) hot-reload via --reload; the `python -m` services
+# pick up edits on a fast `docker compose restart <svc>`.
+x-shared-mount: &shared-mount ./backend/shared:/app/shared
+
 services:
   # --- Infrastructure ---
   redis:
@@ -20,10 +26,14 @@ services:
       - ./infra/docker/redis/redis.conf:/usr/local/etc/redis/redis.conf
     command: redis-server /usr/local/etc/redis/redis.conf
     healthcheck:
+      # Short interval so dependents start fast: podman's compat API rejects
+      # compose's start_interval (needs Engine v25+), and the first probe only
+      # fires after `interval` elapses.
       test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
+      interval: 2s
       timeout: 3s
       retries: 5
+      start_period: 10s
     networks:
       - td-net
 
@@ -40,7 +50,7 @@ services:
       - ./infra/docker/timescaledb/init.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U trader -d tradingdb"]
-      interval: 10s
+      interval: 2s
       timeout: 5s
       retries: 5
       start_period: 30s
@@ -53,8 +63,11 @@ services:
     build:
       context: ./backend
       dockerfile: market_data_service/Dockerfile
+      target: dev
     volumes:
       - ./data:/app/data:ro
+      - *shared-mount
+      - ./backend/market_data_service:/app/market_data_service
     environment:
       REDIS_URL: redis://redis:6379/0
       TIMESCALEDB_URL: postgresql+asyncpg://trader:trader@timescaledb:5432/tradingdb
@@ -65,20 +78,33 @@ services:
       KOTAK_CONSUMER_KEY: ${KOTAK_CONSUMER_KEY:-}
       KOTAK_ENVIRONMENT: ${KOTAK_ENVIRONMENT:-prod}
       INSTRUMENTS_PATH: /app/data/instruments.json
+      # Shell env overrides .env here, so MCX can be enabled for this service alone
+      MCX_ENABLED: ${MCX_ENABLED:-false}
+    # No healthcheck: the old pgrep probe can't run in this image (pgrep not
+    # installed) and only asserted PID 1 exists, which Docker guarantees anyway.
     depends_on:
       redis:
         condition: service_healthy
 
   quant_service:
     <<: *backend-common
+    # tini as PID 1: the service installs no SIGTERM handler, and Python as
+    # PID 1 ignores unhandled SIGTERM — every stop waited the full 10s kill
+    # timeout without this.
+    init: true
     build:
       context: ./backend
       dockerfile: quant_service/Dockerfile
+      target: dev
+    volumes:
+      - ./data:/app/data:ro
+      - *shared-mount
+      - ./backend/quant_service:/app/quant_service
     environment:
       REDIS_URL: redis://redis:6379/0
       TIMESCALEDB_URL: postgresql+asyncpg://trader:trader@timescaledb:5432/tradingdb
       RISK_FREE_RATE: ${RISK_FREE_RATE:-0.065}
-      GREEKS_BATCH_INTERVAL_MS: ${GREEKS_BATCH_INTERVAL_MS:-100}
+      INSTRUMENTS_PATH: /app/data/instruments.json
     depends_on:
       redis:
         condition: service_healthy
@@ -90,17 +116,61 @@ services:
     build:
       context: ./backend
       dockerfile: order_service/Dockerfile
+      target: dev
     ports:
       - "8001:8000"
+    volumes:
+      - *shared-mount
+      - ./backend/order_service:/app/order_service
     environment:
       REDIS_URL: redis://redis:6379/0
       TIMESCALEDB_URL: postgresql+asyncpg://trader:trader@timescaledb:5432/tradingdb
       BROKER_API_KEY: ${BROKER_API_KEY:-}
       BROKER_API_SECRET: ${BROKER_API_SECRET:-}
+    healthcheck:
+      # 3s interval matters: api_gateway waits on this check, and the first
+      # probe only fires after `interval` (podman lacks start_interval).
+      # 10s timeout: the probe spawns a full Python interpreter, which can
+      # exceed 5s when the engine is under load — false "unhealthy" otherwise.
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 3s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     depends_on:
       redis:
         condition: service_healthy
       timescaledb:
+        condition: service_healthy
+
+  session_broker:
+    <<: *backend-common
+    init: true
+    build:
+      context: ./backend
+      dockerfile: session_broker/Dockerfile
+      target: dev
+    volumes:
+      - *shared-mount
+      - ./backend/session_broker:/app/session_broker
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      KOTAK_CONSUMER_KEY: ${KOTAK_CONSUMER_KEY:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  fmp_cron:
+    <<: *backend-common
+    init: true
+    build:
+      context: ./backend
+      dockerfile: docker/fmp-cron.Dockerfile
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
         condition: service_healthy
 
   api_gateway:
@@ -108,26 +178,36 @@ services:
     build:
       context: ./backend
       dockerfile: api_gateway/Dockerfile
+      target: dev
     ports:
       - "8000:8000"
     volumes:
       - ./data:/app/data:ro
+      - *shared-mount
+      - ./backend/api_gateway:/app/api_gateway
     environment:
       REDIS_URL: redis://redis:6379/0
       TIMESCALEDB_URL: postgresql+asyncpg://trader:trader@timescaledb:5432/tradingdb
       ORDER_SERVICE_URL: http://order_service:8000
       JWT_SECRET: ${JWT_SECRET:-local-dev-secret-change-in-prod}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://tauri.localhost,https://tauri.localhost,tauri://localhost}
+      KOTAK_ACCOUNTS: ${KOTAK_ACCOUNTS:-}
       KOTAK_CONSUMER_KEY: ${KOTAK_CONSUMER_KEY:-}
       KOTAK_ENVIRONMENT: ${KOTAK_ENVIRONMENT:-prod}
       INSTRUMENTS_PATH: /app/data/instruments.json
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 5s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     depends_on:
       redis:
         condition: service_healthy
       timescaledb:
         condition: service_healthy
       order_service:
-        condition: service_started
+        condition: service_healthy
 
 volumes:
   redis_data:

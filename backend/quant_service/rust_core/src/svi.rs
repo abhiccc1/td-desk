@@ -71,7 +71,7 @@ pub fn svi_is_arbitrage_free(params: &SviParams, k_min: f64, k_max: f64, n_point
 // ─── Calibration ────────────────────────────────────────────────────
 
 /// Grid search resolution for (ρ, m) in quasi-explicit calibration.
-const RHO_GRID: usize = 21;   // -0.95 to 0.0
+const RHO_GRID: usize = 39;   // -0.95 to 0.95 (both skew directions)
 const M_GRID: usize = 31;     // centered around data mean
 
 /// Fit SVI to market-observed (log-moneyness, implied vol) pairs.
@@ -105,7 +105,7 @@ pub fn svi_calibrate(
 
     // Build grid points
     let rho_points: Vec<f64> = (0..RHO_GRID)
-        .map(|i| -0.95 + i as f64 * 0.95 / (RHO_GRID as f64 - 1.0))
+        .map(|i| -0.95 + i as f64 * 1.90 / (RHO_GRID as f64 - 1.0))
         .collect();
     let m_points: Vec<f64> = (0..M_GRID)
         .map(|i| m_lo + i as f64 * (m_hi - m_lo) / (M_GRID as f64 - 1.0))
@@ -212,6 +212,25 @@ fn fit_abs_for_rho_m(
     }
 
     best
+}
+
+// ─── RMSE ───────────────────────────────────────────────────────────
+
+/// Compute RMSE between SVI-fitted IVs and observed IVs.
+pub fn svi_rmse(params: &SviParams, ks: &[f64], ivs: &[f64], t: f64) -> f64 {
+    if ks.is_empty() || ks.len() != ivs.len() {
+        return 0.0;
+    }
+    let mse: f64 = ks
+        .iter()
+        .zip(ivs.iter())
+        .map(|(&k, &iv)| {
+            let fitted = svi_to_iv(params, k, t);
+            (fitted - iv) * (fitted - iv)
+        })
+        .sum::<f64>()
+        / ks.len() as f64;
+    mse.sqrt()
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────

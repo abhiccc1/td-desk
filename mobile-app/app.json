@@ -1,0 +1,42 @@
+{
+  "expo": {
+    "name": "TD Desk Mobile",
+    "slug": "td-desk-mobile",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "scheme": "tddeskmobile",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "icon": "./assets/icon.png",
+    "android": {
+      "package": "com.tddesk.mobile",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/icon.png",
+        "backgroundColor": "#08111f"
+      },
+      "edgeToEdgeEnabled": true
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true
+          }
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true,
+      "reactCompiler": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "8e5fa600-9452-4106-872d-280daed05976"
+      }
+    },
+    "owner": "abhiccc1"
+  }
+}

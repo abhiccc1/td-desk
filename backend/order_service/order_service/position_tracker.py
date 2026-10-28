@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-
 import structlog
 
 from shared.schemas.order import OrderFill, OrderSide, Position
@@ -14,8 +12,7 @@ log = structlog.get_logger()
 class PositionTracker:
     """Maintain current positions and calculate P&L.
 
-    Positions are held in-memory and persisted to TimescaleDB *order_events*
-    table on each update.
+    Positions are held in-memory for the lightweight order-service workflow.
     """
 
     def __init__(self) -> None:
@@ -43,7 +40,7 @@ class PositionTracker:
 
         new_qty = pos.quantity + signed_qty
         if new_qty != 0 and pos.quantity + signed_qty != 0:
-            total_cost = pos.avg_price * pos.quantity + fill.filled_price * signed_qty
+            total_cost = pos.avg_price * pos.quantity + fill.avg_fill_price * signed_qty
             pos.avg_price = total_cost / new_qty if new_qty else 0.0
         pos.quantity = new_qty
         pos.side = OrderSide.BUY if new_qty >= 0 else OrderSide.SELL
@@ -54,6 +51,7 @@ class PositionTracker:
             qty=pos.quantity,
             avg_price=pos.avg_price,
         )
+
         return pos
 
     def calculate_pnl(self, ltp_map: dict[str, float]) -> dict[str, float]:
@@ -66,14 +64,3 @@ class PositionTracker:
 
     def get_positions(self) -> list[Position]:
         return list(self.positions.values())
-
-    async def persist(self) -> None:
-        """Persist current positions to TimescaleDB order_events table.
-
-        TODO: implement actual DB write via shared.db.get_engine().
-        """
-        log.info(
-            "position_tracker.persist",
-            num_positions=len(self.positions),
-            ts=datetime.now(timezone.utc).isoformat(),
-        )

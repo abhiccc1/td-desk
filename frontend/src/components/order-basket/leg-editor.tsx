@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback } from "react";
+import { priceTick, underlyingOfSymbol } from "@/lib/instruments";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -105,7 +106,7 @@ export function LegEditor({ leg, index, onUpdate, onRemove }: LegEditorProps) {
           handleChange("premium", parseFloat(e.target.value) || 0)
         }
         placeholder="Premium"
-        step={0.05}
+        step={priceTick(underlyingOfSymbol(leg.symbol))}
         className="h-7 w-16 border-panel-border bg-panel px-1.5 py-0.5 text-xs text-panel-muted placeholder:text-panel-faint"
       />
 

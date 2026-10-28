@@ -29,15 +29,24 @@ class KotakAuthManager:
 
     Usage::
 
-        mgr = KotakAuthManager(consumer_key="...")
+        mgr = KotakAuthManager(consumer_key="...", account_id="primary", ucc="ABCD1")
         await mgr.totp_login(mobile, ucc, totp)
         await mgr.totp_validate(mpin)
         creds = mgr.credentials
     """
 
-    def __init__(self, consumer_key: str, environment: str = "prod") -> None:
+    def __init__(
+        self,
+        consumer_key: str,
+        environment: str = "prod",
+        *,
+        account_id: str = "",
+        ucc: str = "",
+    ) -> None:
         self._consumer_key = consumer_key
         self._environment = environment
+        self._account_id = account_id
+        self._ucc = ucc
         self._client = httpx.AsyncClient(timeout=30.0)
         self._lock = asyncio.Lock()
 
@@ -56,12 +65,20 @@ class KotakAuthManager:
         return self._state
 
     @property
+    def account_id(self) -> str:
+        return self._account_id
+
+    @property
+    def ucc(self) -> str:
+        return self._ucc
+
+    @property
     def credentials(self) -> BrokerCredentials:
         if self._state != AuthState.AUTHENTICATED:
             raise AuthStateError("Cannot get credentials before authentication completes")
         return BrokerCredentials(
             broker_name="kotak",
-            client_id="",
+            client_id=self._ucc,
             access_token=SecretStr(self._edit_token),
             extra={
                 "sid": self._edit_sid,
@@ -69,6 +86,12 @@ class KotakAuthManager:
                 "data_center": self._data_center or "",
                 "base_url": self._base_url or "",
                 "environment": self._environment,
+                # Travels with the credentials so every service uses the key and
+                # account identity of whoever actually logged in, rather than a
+                # process-wide env default.
+                "consumer_key": self._consumer_key,
+                "account_id": self._account_id,
+                "ucc": self._ucc,
             },
         )
 
@@ -96,8 +119,10 @@ class KotakAuthManager:
                 self._reset()
                 raise BrokerAuthError(f"Missing token/sid in TOTP login response: {payload}")
 
+            if not self._ucc:
+                self._ucc = ucc
             self._state = AuthState.TOTP_PENDING
-            logger.info("kotak_auth.totp_login_ok")
+            logger.info("kotak_auth.totp_login_ok", account_id=self._account_id, ucc=self._ucc)
             return {"status": "totp_pending"}
 
     async def totp_validate(self, mpin: str) -> dict:
@@ -130,7 +155,12 @@ class KotakAuthManager:
                 raise BrokerAuthError(f"Missing edit tokens in TOTP validate response: {payload}")
 
             self._state = AuthState.AUTHENTICATED
-            logger.info("kotak_auth.authenticated", data_center=self._data_center)
+            logger.info(
+                "kotak_auth.authenticated",
+                data_center=self._data_center,
+                account_id=self._account_id,
+                ucc=self._ucc,
+            )
             return {"status": "authenticated"}
 
     def _reset(self) -> None:
@@ -145,3 +175,6 @@ class KotakAuthManager:
 
     async def close(self) -> None:
         await self._client.aclose()
+
+    def reset(self) -> None:
+        self._reset()

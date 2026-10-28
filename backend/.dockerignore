@@ -1,0 +1,15 @@
+**/__pycache__/
+*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.venv/
+**/build/
+**/dist/
+**/*.egg-info/
+.coverage
+
+# Rust build artifacts — huge (100s of MB) and must never enter the build
+# context or the rust-builder COPY layer, or every local cargo run busts
+# the Docker cache and forces a full release recompile.
+**/target/

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from market_data_service import scrip_master
 from market_data_service.scrip_master import (
     ScripMasterResult,
     _parse_csv,
@@ -52,6 +53,11 @@ class TestParseCsv:
     @pytest.fixture
     def im(self):
         return InstrumentMaster(INSTRUMENTS_PATH)
+
+    @pytest.fixture(autouse=True)
+    def _pin_today(self, monkeypatch):
+        # Fixture expiries are in 2026; pin "today" so they stay unexpired.
+        monkeypatch.setattr(scrip_master, "_today_ist", lambda: "2026-01-01")
 
     def test_basic_parsing(self, im):
         csv = self._make_csv(
@@ -162,3 +168,103 @@ class TestParseCsv:
         # But trading symbol for this entry won't be cached (empty pTrdSymbol)
         sym_map = result.trading_symbols.get("NIFTY", {}).get("2026-03-19", {})
         assert "23100:CE" not in sym_map
+
+
+# ---------------------------------------------------------------------------
+# MCX options-on-futures. Fixture rows are copied verbatim from Kotak's
+# mcx_fo.csv of 2026-09-25 (pScripRefKey empty, sci-notation strikes).
+# ---------------------------------------------------------------------------
+
+MCX_FIXTURE = Path(__file__).parent / "fixtures" / "mcx_fo_sample.csv"
+
+
+class TestParseMcx:
+    @pytest.fixture
+    def im(self, monkeypatch):
+        monkeypatch.setenv("MCX_ENABLED", "1")
+        return InstrumentMaster(INSTRUMENTS_PATH)
+
+    @pytest.fixture(autouse=True)
+    def _pin_today(self, monkeypatch):
+        monkeypatch.setattr(scrip_master, "_today_ist", lambda: "2026-09-25")
+
+    @pytest.fixture
+    def result(self, im):
+        result = ScripMasterResult()
+        _parse_csv(MCX_FIXTURE.read_text(), result, im)
+        return result
+
+    def test_flag_off_ignores_mcx(self, monkeypatch):
+        monkeypatch.delenv("MCX_ENABLED", raising=False)
+        result = ScripMasterResult()
+        _parse_csv(MCX_FIXTURE.read_text(), result, InstrumentMaster(INSTRUMENTS_PATH))
+        assert not result.expiries
+
+    def test_only_requested_symbols(self, result):
+        assert set(result.expiries) == {
+            "CRUDEOIL", "CRUDEOILM", "NATURALGAS", "NATGASMINI", "GOLD", "GOLDM",
+        }
+
+    def test_expiries_from_epoch(self, result):
+        assert result.expiries["CRUDEOIL"] == ["2026-10-15", "2026-11-17", "2026-12-16"]
+        assert result.expiries["NATURALGAS"] == ["2026-10-23", "2026-11-20"]
+        # Expiring today is still listed
+        assert result.expiries["GOLD"][0] == "2026-09-25"
+
+    def test_sci_notation_strike_and_trading_symbol(self, result):
+        assert result.trading_symbols["GOLD"]["2026-11-27"]["154000:CE"] == "GOLD27NOV26154000CE"
+        assert result.trading_symbols["CRUDEOIL"]["2026-11-17"]["10000:CE"] == "CRUDEOIL17NOV2610000CE"
+        assert result.scrip_tokens["GOLD"]["2026-11-27"]["154000:CE"] == "556648"
+        assert result.token_to_symbol["556648"] == "GOLD 261127 154000 CE"
+        assert result.token_segment["556648"] == "mcx_fo"
+
+    def test_underlying_future_from_asset_code(self, result):
+        uf = result.underlying_future
+        assert uf["CRUDEOIL"]["2026-11-17"]["tradingSymbol"] == "CRUDEOIL19NOV26FUT"
+        assert uf["CRUDEOIL"]["2026-11-17"]["token"] == "573422"
+        # GOLD Oct and Nov options both devolve into the DEC future
+        assert uf["GOLD"]["2026-10-30"]["tradingSymbol"] == "GOLD04DEC26FUT"
+        assert uf["GOLD"]["2026-11-27"]["tradingSymbol"] == "GOLD04DEC26FUT"
+        assert uf["NATURALGAS"]["2026-10-23"]["expiry"] == "2026-10-27"
+
+    def test_future_token_subscribed_with_chain(self, result):
+        assert "mcx_fo|573422" in result.tokens["CRUDEOIL"]["2026-11-17"]
+        assert result.token_to_symbol["573422"] == "CRUDEOIL 261119 FUT"
+
+    @pytest.mark.parametrize("underlying,expiry,lot,mult,max_qty", [
+        ("CRUDEOIL", "2026-10-15", 100, 100, 10000),
+        ("CRUDEOILM", "2026-10-15", 10, 10, 10000),
+        ("NATURALGAS", "2026-10-23", 1250, 1250, 60000),
+        ("NATGASMINI", "2026-10-23", 250, 250, 60000),
+        ("GOLD", "2026-10-30", 1, 100, 100),
+        ("GOLDM", "2026-10-29", 100, 10, 10000),
+    ])
+    def test_contract_meta(self, result, im, underlying, expiry, lot, mult, max_qty):
+        meta = result.contract_meta[underlying][expiry]
+        assert (meta["lotSize"], meta["pnlMultiplier"], meta["maxOrderQty"]) == (lot, mult, max_qty)
+        cfg = im.get(underlying)
+        # instruments.json must agree with the scrip master
+        assert (cfg.lot_size, cfg.effective_pnl_multiplier, cfg.freeze_quantity) == (lot, mult, max_qty)
+
+    def test_epoch_symbol_mismatch_drops_row(self, im):
+        # Corrupt the epoch for one option: 27NOV26 → a day later
+        lines = MCX_FIXTURE.read_text().splitlines()
+        for i, line in enumerate(lines):
+            if "GOLD27NOV26154000CE" in line:
+                lines[i] = line.replace("1795823999", "1795910399")
+        result = ScripMasterResult()
+        _parse_csv("\n".join(lines) + "\n", result, im)
+        assert "154000:CE" not in result.trading_symbols["GOLD"]["2026-11-27"]
+        assert "158000:CE" in result.trading_symbols["GOLD"]["2026-11-27"]
+
+    def test_missing_future_drops_expiry(self, im):
+        lines = [
+            ln for ln in MCX_FIXTURE.read_text().splitlines()
+            if "CRUDEOIL19NOV26FUT" not in ln
+        ]
+        result = ScripMasterResult()
+        _parse_csv("\n".join(lines) + "\n", result, im)
+        assert "2026-11-17" not in result.expiries["CRUDEOIL"]
+        assert "2026-10-15" in result.expiries["CRUDEOIL"]
+        # The mini is untouched (it has its own future)
+        assert "2026-11-17" in result.expiries["CRUDEOILM"]

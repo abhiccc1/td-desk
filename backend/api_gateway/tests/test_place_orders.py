@@ -198,6 +198,14 @@ class _PatchCtx:
             "api_gateway.routers.orders._get_neo_client",
             new_callable=AsyncMock, return_value=self.neo_client,
         ).__enter__()
+        # place_orders() loads the session again after a successful placement
+        # to kick off the background trade-fill persist. Unmocked it reaches
+        # real Redis and the endpoint 401s.
+        self._mocks["session"] = patch(
+            "api_gateway.routers.orders._load_kotak_session",
+            new_callable=AsyncMock,
+            return_value=("https://example.invalid", {"Auth": "tok", "Sid": "sid"}),
+        ).__enter__()
 
         hgetall_mock = patch(
             "shared.redis_client.cache_hgetall",

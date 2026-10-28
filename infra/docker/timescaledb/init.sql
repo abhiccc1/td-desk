@@ -35,27 +35,6 @@ FROM ticks
 GROUP BY bucket, symbol
 WITH NO DATA;
 
--- Greeks hypertable
-CREATE TABLE IF NOT EXISTS greeks (
-    time             TIMESTAMPTZ      NOT NULL,
-    symbol           TEXT             NOT NULL,
-    underlying       TEXT             NOT NULL,
-    expiry           DATE             NOT NULL,
-    strike           DOUBLE PRECISION NOT NULL,
-    option_type      CHAR(1)          NOT NULL,
-    iv               DOUBLE PRECISION,
-    delta            DOUBLE PRECISION,
-    gamma            DOUBLE PRECISION,
-    theta            DOUBLE PRECISION,
-    vega             DOUBLE PRECISION,
-    underlying_price DOUBLE PRECISION
-);
-SELECT create_hypertable('greeks', by_range('time'), if_not_exists => TRUE);
-
-CREATE UNIQUE INDEX IF NOT EXISTS greeks_time_symbol_unique ON greeks (time, symbol);
-CREATE INDEX IF NOT EXISTS idx_greeks_symbol_time ON greeks (symbol, time DESC);
-CREATE INDEX IF NOT EXISTS idx_greeks_underlying_expiry ON greeks (underlying, expiry, time DESC);
-
 -- IV history for IV Rank/Percentile computation
 CREATE TABLE IF NOT EXISTS iv_history (
     time        TIMESTAMPTZ      NOT NULL,
@@ -67,39 +46,113 @@ SELECT create_hypertable('iv_history', by_range('time'), if_not_exists => TRUE);
 
 CREATE INDEX IF NOT EXISTS idx_iv_history_underlying_time ON iv_history (underlying, time DESC);
 
--- Order events audit log
-CREATE TABLE IF NOT EXISTS order_events (
-    time            TIMESTAMPTZ NOT NULL,
-    order_id        UUID        NOT NULL,
-    basket_id       UUID,
-    user_id         TEXT        NOT NULL,
-    symbol          TEXT        NOT NULL,
-    side            TEXT        NOT NULL,
-    order_type      TEXT        NOT NULL,
-    quantity         INTEGER     NOT NULL,
-    price           DOUBLE PRECISION,
-    filled_qty      INTEGER     DEFAULT 0,
-    avg_fill_price  DOUBLE PRECISION,
-    status          TEXT        NOT NULL,
-    exchange        TEXT        NOT NULL,
-    broker_order_id TEXT
+-- Trade logs — persistent record of every execution fill for FIFO P&L
+CREATE TABLE IF NOT EXISTS trade_logs (
+    time            TIMESTAMPTZ      NOT NULL,
+    -- Broker account (UCC) the fill belongs to. Every read filters on it so
+    -- switching accounts never merges one account's history into another's.
+    ucc             TEXT             NOT NULL DEFAULT '',
+    symbol          TEXT             NOT NULL,
+    trading_symbol  TEXT             NOT NULL,
+    underlying      TEXT,
+    expiry          DATE,
+    strike          DOUBLE PRECISION,
+    option_type     CHAR(2),
+    side            TEXT             NOT NULL,
+    quantity        INTEGER          NOT NULL,
+    price           DOUBLE PRECISION NOT NULL,
+    value           DOUBLE PRECISION NOT NULL,
+    order_id        TEXT             NOT NULL DEFAULT '',
+    fill_id         TEXT             NOT NULL DEFAULT '',
+    exchange        TEXT             NOT NULL,
+    product_type    TEXT,
+    multiplier      INTEGER          DEFAULT 1
 );
-SELECT create_hypertable('order_events', by_range('time'), if_not_exists => TRUE);
+SELECT create_hypertable('trade_logs', by_range('time'), if_not_exists => TRUE);
 
-CREATE INDEX IF NOT EXISTS idx_orders_user_time ON order_events (user_id, time DESC);
-CREATE INDEX IF NOT EXISTS idx_orders_basket ON order_events (basket_id, time DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_logs_fill ON trade_logs (time, ucc, fill_id, order_id);
+CREATE INDEX IF NOT EXISTS idx_trade_logs_symbol_time ON trade_logs (ucc, symbol, time DESC);
+CREATE INDEX IF NOT EXISTS idx_trade_logs_underlying_expiry ON trade_logs (ucc, underlying, expiry, time DESC);
 
--- Portfolio snapshots
-CREATE TABLE IF NOT EXISTS portfolio_snapshots (
-    time           TIMESTAMPTZ    NOT NULL,
-    user_id        TEXT           NOT NULL,
-    net_delta      DOUBLE PRECISION,
-    net_gamma      DOUBLE PRECISION,
-    net_theta      DOUBLE PRECISION,
-    net_vega       DOUBLE PRECISION,
-    total_margin   DOUBLE PRECISION,
-    unrealized_pnl DOUBLE PRECISION,
-    var_95         DOUBLE PRECISION,
-    positions_json JSONB
+-- Positions — current position state (source of truth, not time-series)
+CREATE TABLE IF NOT EXISTS positions (
+    trading_symbol  TEXT             PRIMARY KEY,
+    symbol          TEXT             NOT NULL,
+    exchange        TEXT,
+    product_type    TEXT,
+    option_type     TEXT,
+    strike_price    TEXT,
+    expiry          TEXT,
+    lot_size        INTEGER          DEFAULT 1,
+    total_buy_qty   INTEGER          DEFAULT 0,
+    total_sell_qty  INTEGER          DEFAULT 0,
+    net_qty         INTEGER          DEFAULT 0,
+    cf_qty          INTEGER          DEFAULT 0,
+    side            TEXT,
+    is_open         BOOLEAN          DEFAULT true,
+    total_buy_amt   DOUBLE PRECISION DEFAULT 0,
+    total_sell_amt  DOUBLE PRECISION DEFAULT 0,
+    buy_avg_price   DOUBLE PRECISION DEFAULT 0,
+    sell_avg_price  DOUBLE PRECISION DEFAULT 0,
+    avg_price       DOUBLE PRECISION DEFAULT 0,
+    booked_pnl      DOUBLE PRECISION DEFAULT 0,
+    multiplier      INTEGER          DEFAULT 1,
+    precision       INTEGER          DEFAULT 2,
+    updated_at      TIMESTAMPTZ      DEFAULT now()
 );
-SELECT create_hypertable('portfolio_snapshots', by_range('time'), if_not_exists => TRUE);
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- Paper trading — fully isolated from live trading.
+-- Mirrors trade_logs / positions but written ONLY by the paper-trading router
+-- (backend/api_gateway/api_gateway/routers/paper_trading.py), which never
+-- touches the live broker.  Simulated fills happen at the live LTP from Redis.
+-- ─────────────────────────────────────────────────────────────────────────
+
+-- Paper trade logs — every simulated fill (append-only, mirror of trade_logs)
+CREATE TABLE IF NOT EXISTS paper_trade_logs (
+    time            TIMESTAMPTZ      NOT NULL,
+    symbol          TEXT             NOT NULL,
+    trading_symbol  TEXT             NOT NULL,
+    underlying      TEXT,
+    expiry          DATE,
+    strike          DOUBLE PRECISION,
+    option_type     CHAR(2),
+    side            TEXT             NOT NULL,
+    quantity        INTEGER          NOT NULL,
+    price           DOUBLE PRECISION NOT NULL,
+    value           DOUBLE PRECISION NOT NULL,
+    order_id        TEXT             NOT NULL DEFAULT '',
+    fill_id         TEXT             NOT NULL DEFAULT '',
+    exchange        TEXT             NOT NULL,
+    product_type    TEXT,
+    multiplier      DOUBLE PRECISION DEFAULT 1
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_trade_logs_symbol_time ON paper_trade_logs (symbol, time DESC);
+
+-- Paper positions — current simulated position state (mirror of positions)
+CREATE TABLE IF NOT EXISTS paper_positions (
+    trading_symbol  TEXT             PRIMARY KEY,
+    symbol          TEXT             NOT NULL,
+    exchange        TEXT,
+    product_type    TEXT,
+    option_type     TEXT,
+    strike_price    TEXT,
+    expiry          TEXT,
+    lot_size        INTEGER          DEFAULT 1,
+    total_buy_qty   INTEGER          DEFAULT 0,
+    total_sell_qty  INTEGER          DEFAULT 0,
+    net_qty         INTEGER          DEFAULT 0,
+    cf_qty          INTEGER          DEFAULT 0,
+    side            TEXT,
+    is_open         BOOLEAN          DEFAULT true,
+    total_buy_amt   DOUBLE PRECISION DEFAULT 0,
+    total_sell_amt  DOUBLE PRECISION DEFAULT 0,
+    buy_avg_price   DOUBLE PRECISION DEFAULT 0,
+    sell_avg_price  DOUBLE PRECISION DEFAULT 0,
+    avg_price       DOUBLE PRECISION DEFAULT 0,
+    booked_pnl      DOUBLE PRECISION DEFAULT 0,
+    multiplier      DOUBLE PRECISION DEFAULT 1,
+    precision       INTEGER          DEFAULT 2,
+    updated_at      TIMESTAMPTZ      DEFAULT now()
+);

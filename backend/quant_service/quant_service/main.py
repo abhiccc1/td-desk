@@ -27,18 +27,13 @@ async def _run() -> None:
     import quant_service.indicators  # noqa: F401
 
     from quant_service.publisher import ResultPublisher
-    from quant_service.persistence import DataPersister
     from quant_service.subscriber import EventSubscriber
 
     publisher = ResultPublisher(redis_url=settings.redis_url)
-    persister = DataPersister(db_url=settings.timescaledb_url)
-
-    await persister.start()
 
     subscriber = EventSubscriber(
         redis_url=settings.redis_url,
         publisher=publisher,
-        persister=persister,
     )
 
     log.info("quant_service.ready")
@@ -47,9 +42,8 @@ async def _run() -> None:
         await subscriber.run()
     except asyncio.CancelledError:
         log.info("quant_service.shutting_down")
-    finally:
-        await persister.stop()
-        log.info("quant_service.stopped")
+
+    log.info("quant_service.stopped")
 
 
 def main() -> None:

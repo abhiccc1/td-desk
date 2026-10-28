@@ -7,6 +7,9 @@ edition = "2024"
 name = "td_core"
 crate-type = ["cdylib"]
 
+[profile.release]
+lto = true
+
 [dependencies]
 pyo3 = { version = "0.25", features = ["extension-module"] }
 libm = "0.2"

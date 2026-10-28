@@ -13,6 +13,7 @@
 
 use num_complex::Complex64;
 
+use crate::batch_complex::{batch_complex_exp, batch_complex_ln, batch_complex_mul};
 use crate::bsm;
 use crate::fft::{self, CarrMadanConfig, CharacteristicFunction};
 
@@ -61,6 +62,87 @@ impl CharacteristicFunction for VgParams {
         let drift_part = (i * u * (log_spot + (r + omega) * t)).exp();
 
         drift_part * vg_part
+    }
+
+    fn cf_batch(
+        &self,
+        u_re: &[f64],
+        u_im: &[f64],
+        t: f64,
+        r: f64,
+        spot: f64,
+        out_re: &mut [f64],
+        out_im: &mut [f64],
+    ) {
+        let n = u_re.len();
+        if u_im.len() != n || out_re.len() != n || out_im.len() != n {
+            return;
+        }
+
+        let sigma = self.sigma;
+        let theta = self.theta;
+        let nu = self.nu;
+
+        let half_sigma_sq_nu = 0.5 * sigma * sigma * nu;
+        let theta_nu = theta * nu;
+        let exponent = -t / nu;
+        let drift_scale = spot.ln() + (r + (1.0 / nu) * (1.0 - theta * nu - 0.5 * sigma * sigma * nu).ln()) * t;
+
+        let mut u_sq_re = vec![0.0; n];
+        let mut u_sq_im = vec![0.0; n];
+        batch_complex_mul(u_re, u_im, u_re, u_im, &mut u_sq_re, &mut u_sq_im);
+
+        let mut kernel_re = vec![0.0; n];
+        let mut kernel_im = vec![0.0; n];
+        for j in 0..n {
+            kernel_re[j] = 1.0 + theta_nu * u_im[j] + half_sigma_sq_nu * u_sq_re[j];
+            kernel_im[j] = -theta_nu * u_re[j] + half_sigma_sq_nu * u_sq_im[j];
+        }
+
+        let mut log_kernel_re = vec![0.0; n];
+        let mut log_kernel_im = vec![0.0; n];
+        batch_complex_ln(
+            &kernel_re,
+            &kernel_im,
+            &mut log_kernel_re,
+            &mut log_kernel_im,
+        );
+
+        let mut vg_exp_re = vec![0.0; n];
+        let mut vg_exp_im = vec![0.0; n];
+        for j in 0..n {
+            vg_exp_re[j] = exponent * log_kernel_re[j];
+            vg_exp_im[j] = exponent * log_kernel_im[j];
+        }
+
+        let mut vg_part_re = vec![0.0; n];
+        let mut vg_part_im = vec![0.0; n];
+        batch_complex_exp(&vg_exp_re, &vg_exp_im, &mut vg_part_re, &mut vg_part_im);
+
+        let mut drift_re = vec![0.0; n];
+        let mut drift_im = vec![0.0; n];
+        for j in 0..n {
+            drift_re[j] = -u_im[j] * drift_scale;
+            drift_im[j] = u_re[j] * drift_scale;
+        }
+
+        let mut drift_part_re = vec![0.0; n];
+        let mut drift_part_im = vec![0.0; n];
+        batch_complex_exp(
+            &drift_re,
+            &drift_im,
+            &mut drift_part_re,
+            &mut drift_part_im,
+        );
+
+        batch_complex_mul(
+            &drift_part_re,
+            &drift_part_im,
+            &vg_part_re,
+            &vg_part_im,
+            out_re,
+            out_im,
+        );
     }
 }
 
@@ -147,6 +229,41 @@ pub fn vg_iv_puts(
         .collect()
 }
 
+// ─── Combined chain (prices + IVs in a single FFT pass) ─────────────
+
+/// Compute call prices, put prices, and call IVs from a single FFT pass.
+///
+/// This avoids the redundancy of calling `vg_price_chain` followed by N
+/// individual `bsm::implied_volatility` calls — everything is done in Rust
+/// with only one Python↔Rust crossing.
+pub fn vg_chain_full(
+    params: &VgParams,
+    spot: f64,
+    r: f64,
+    t: f64,
+    strikes: &[f64],
+) -> (Vec<f64>, Vec<f64>, Vec<Option<f64>>) {
+    // 1. Compute call prices via FFT (single pass)
+    let calls = vg_price_calls(params, spot, r, t, strikes);
+
+    // 2. Compute puts via put-call parity (same formula as vg_price_chain)
+    let df = (-r * t).exp();
+    let puts: Vec<f64> = calls
+        .iter()
+        .zip(strikes.iter())
+        .map(|(&c, &k)| (c - spot + k * df).max(0.0))
+        .collect();
+
+    // 3. Batch IV inversion from call prices (all in Rust, no Python round-trips)
+    let ivs: Vec<Option<f64>> = calls
+        .iter()
+        .zip(strikes.iter())
+        .map(|(&c, &k)| bsm::implied_volatility(c, spot, k, t, r, true))
+        .collect();
+
+    (calls, puts, ivs)
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -170,6 +287,33 @@ mod tests {
             (cf0.re - 1.0).abs() < 1e-10 && cf0.im.abs() < 1e-10,
             "CF(0) = {cf0}, expected 1+0i",
         );
+    }
+
+    #[test]
+    fn test_vg_cf_batch_matches_scalar() {
+        let p = test_params();
+        let u_re = vec![0.0, 0.2, 0.7, 1.1];
+        let u_im = vec![0.0, -0.5, -1.5, 0.4];
+        let mut out_re = vec![0.0; u_re.len()];
+        let mut out_im = vec![0.0; u_re.len()];
+
+        p.cf_batch(&u_re, &u_im, 0.08, 0.065, 22000.0, &mut out_re, &mut out_im);
+
+        for j in 0..u_re.len() {
+            let scalar = p.cf(Complex64::new(u_re[j], u_im[j]), 0.08, 0.065, 22000.0);
+            assert!(
+                (out_re[j] - scalar.re).abs() < 1e-10,
+                "batch cf real mismatch at {j}: {} vs {}",
+                out_re[j],
+                scalar.re,
+            );
+            assert!(
+                (out_im[j] - scalar.im).abs() < 1e-10,
+                "batch cf imag mismatch at {j}: {} vs {}",
+                out_im[j],
+                scalar.im,
+            );
+        }
     }
 
     #[test]

@@ -1,8 +1,19 @@
 from shared.schemas.events import EventType, RedisEvent
-from shared.schemas.tick import TickData, OptionStrike, OptionChainSnapshot
-from shared.schemas.greeks import GreeksResult, SviParams, IVSurface
-from shared.schemas.order import OrderRequest, OrderFill, Position
-from shared.schemas.strategy import StrategyLeg, StrategyResult, MarginInfo
+from shared.schemas.greeks import GreeksResult, IVSurface, SviParams
+from shared.schemas.order import OrderFill, OrderRequest, Position
+from shared.schemas.regime import RegimeSnapshot, TradeQualityAssessment
+from shared.schemas.risk import (
+    AdjustmentSuggestion,
+    ExpiryRiskSummary,
+    GreekExposure,
+    PortfolioRiskResult,
+    RiskFlag,
+    ScenarioPnl,
+    StrategyTailRisk,
+    UnderlyingRiskSummary,
+)
+from shared.schemas.strategy import MarginInfo, StrategyLeg, StrategyResult
+from shared.schemas.tick import OptionChainSnapshot, OptionStrike, TickData
 
 __all__ = [
     "EventType",
@@ -19,4 +30,14 @@ __all__ = [
     "StrategyLeg",
     "StrategyResult",
     "MarginInfo",
+    "RegimeSnapshot",
+    "TradeQualityAssessment",
+    "AdjustmentSuggestion",
+    "ExpiryRiskSummary",
+    "GreekExposure",
+    "PortfolioRiskResult",
+    "RiskFlag",
+    "ScenarioPnl",
+    "StrategyTailRisk",
+    "UnderlyingRiskSummary",
 ]

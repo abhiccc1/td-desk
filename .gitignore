@@ -71,3 +71,10 @@ frontend/src-tauri/gen/schemas/
 
 # Local data volumes
 data/
+
+# Operational backups. Redis dumps hold `session:kotak:current` and
+# `cache:auth:kotak` — live broker JWTs with ["Trade"] scope. Never commit one.
+.ops-backups/
+*.rdb
+*.aof
+dump.rdb

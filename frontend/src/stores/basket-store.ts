@@ -1,6 +1,7 @@
 import { create } from "zustand";
 
-import type { OptionType, ProductType, Side, StrategyLeg } from "@/types/market-data";
+import type { OptionType, ProductType, Side, StrategyLeg, StrategyResult } from "@/types/market-data";
+import { legValue } from "@/lib/instruments";
 import type { OrderStatus } from "@/types/orders";
 import { getLotSize } from "@/lib/lot-sizes";
 
@@ -11,6 +12,9 @@ interface BasketState {
   status: OrderStatus;
   productType: ProductType;
   lots: number;
+  analysisResult: StrategyResult | null;
+  /** When true, the order drawer places SIMULATED (paper) orders, not live. */
+  paperMode: boolean;
 }
 
 interface AddLegFromChainParams {
@@ -32,9 +36,43 @@ interface BasketActions {
   setStatus: (status: OrderStatus) => void;
   setProductType: (productType: ProductType) => void;
   setLots: (lots: number) => void;
+  setAnalysisResult: (result: StrategyResult | null) => void;
+  setPaperMode: (paperMode: boolean) => void;
 }
 
 export type BasketStore = BasketState & BasketActions;
+
+function normalizeSymbol(symbol: string): string {
+  return symbol.trim().toUpperCase();
+}
+
+function legsMatchContract(a: StrategyLeg, b: StrategyLeg): boolean {
+  const aSymbol = normalizeSymbol(a.symbol);
+  const bSymbol = normalizeSymbol(b.symbol);
+
+  if (aSymbol && bSymbol) {
+    return aSymbol === bSymbol;
+  }
+
+  return (
+    a.strike > 0 &&
+    b.strike > 0 &&
+    a.strike === b.strike &&
+    a.optionType === b.optionType &&
+    aSymbol === bSymbol
+  );
+}
+
+function findOppositeSideConflict(
+  legs: StrategyLeg[],
+  candidate: StrategyLeg,
+  ignoreIndex?: number,
+): number {
+  return legs.findIndex((leg, index) => {
+    if (ignoreIndex !== undefined && index === ignoreIndex) return false;
+    return legsMatchContract(leg, candidate) && leg.side !== candidate.side;
+  });
+}
 
 function inferLegLotSize(leg: StrategyLeg, basketLots: number): number {
   const underlying = leg.symbol.replace(/[\d\s].*/, "");
@@ -51,7 +89,8 @@ function inferLegLotSize(leg: StrategyLeg, basketLots: number): number {
 
 function computeNetCredit(legs: StrategyLeg[]): number {
   return legs.reduce((acc, leg) => {
-    const value = leg.premium * leg.quantity;
+    // ₹ value: × unit multiplier (GOLD 100, GOLDM 0.1, NSE/BSE 1)
+    const value = legValue(leg.symbol, leg.premium, leg.quantity);
     return leg.side === "SELL" ? acc + value : acc - value;
   }, 0);
 }
@@ -73,9 +112,9 @@ function buildSymbol(
   strike: number,
   optionType: OptionType,
 ): string {
-  // expiry format: "2026-03-19" → "20260319"
-  const expiryCompact = expiry.replace(/-/g, "");
-  return `${underlying}${expiryCompact}${strike}${optionType}`;
+  // expiry "2026-03-19" → "260319" (YYMMDD)
+  const compact = expiry.replace(/-/g, "").slice(2); // "20260319" → "260319"
+  return `${underlying} ${compact} ${strike} ${optionType}`;
 }
 
 /** Returns a Set of keys like "22500-CE-SELL" for quick lookup */
@@ -94,20 +133,38 @@ export const useBasketStore = create<BasketStore>()((set, get) => ({
   status: "DRAFT" as OrderStatus,
   productType: "NRML" as ProductType,
   lots: 1,
+  analysisResult: null,
+  paperMode: false,
 
   addLeg: (leg: StrategyLeg) => {
-    const legs = sortLegs([...get().legs, leg]);
+    const current = get().legs;
+    // Block duplicate: same symbol already in basket
+    if (current.some((l) => l.symbol === leg.symbol)) return;
+    if (findOppositeSideConflict(current, leg) !== -1) return;
+    const legs = sortLegs([...current, leg]);
     set({ legs, netCredit: computeNetCredit(legs) });
   },
 
   addLegFromChain: (params: AddLegFromChainParams) => {
     const { strike, optionType, side, premium, underlying, expiry } = params;
     const current = get().legs;
+    const symbol = buildSymbol(underlying, expiry, strike, optionType);
+    const candidate: StrategyLeg = {
+      symbol,
+      strike,
+      optionType,
+      side,
+      quantity: getLotSize(underlying) * get().lots,
+      premium,
+      orderType: "LIMIT",
+      productType: get().productType,
+      underlying,
+      expiry,
+    };
 
     // Deduplicate: if same strike/type/side exists, update premium
     const existingIndex = current.findIndex(
-      (l) =>
-        l.strike === strike && l.optionType === optionType && l.side === side,
+      (l) => legsMatchContract(l, candidate) && l.side === side,
     );
 
     if (existingIndex !== -1) {
@@ -118,18 +175,11 @@ export const useBasketStore = create<BasketStore>()((set, get) => ({
       return;
     }
 
-    const symbol = buildSymbol(underlying, expiry, strike, optionType);
-    const newLeg: StrategyLeg = {
-      symbol,
-      strike,
-      optionType,
-      side,
-      quantity: getLotSize(underlying) * get().lots,
-      premium,
-      orderType: "LIMIT",
-      productType: get().productType,
-    };
-    const legs = sortLegs([...current, newLeg]);
+    if (findOppositeSideConflict(current, candidate) !== -1) {
+      return;
+    }
+
+    const legs = sortLegs([...current, candidate]);
     set({ legs, netCredit: computeNetCredit(legs) });
   },
 
@@ -146,7 +196,8 @@ export const useBasketStore = create<BasketStore>()((set, get) => ({
   },
 
   updateLeg: (index: number, update: Partial<StrategyLeg>) => {
-    const legs = get().legs.map((leg, i) => {
+    const current = get().legs;
+    const legs = current.map((leg, i) => {
       if (i !== index) return leg;
       const merged = { ...leg, ...update };
       // Snap quantity to nearest lot size multiple
@@ -158,11 +209,24 @@ export const useBasketStore = create<BasketStore>()((set, get) => ({
       }
       return merged;
     });
+
+    if (findOppositeSideConflict(legs, legs[index], index) !== -1) {
+      return;
+    }
+
     set({ legs, netCredit: computeNetCredit(legs) });
   },
 
   clearBasket: () => {
-    set({ basketId: null, legs: [], netCredit: 0, status: "DRAFT" });
+    set({ basketId: null, legs: [], netCredit: 0, status: "DRAFT", analysisResult: null });
+  },
+
+  setAnalysisResult: (result: StrategyResult | null) => {
+    set({ analysisResult: result });
+  },
+
+  setPaperMode: (paperMode: boolean) => {
+    set({ paperMode });
   },
 
   setStatus: (status: OrderStatus) => {

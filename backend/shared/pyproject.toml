@@ -10,7 +10,11 @@ dependencies = [
     "pydantic>=2.5",
     "pydantic-settings>=2.1",
     "redis>=5.0",
-    "sqlalchemy>=2.0",
+    # [asyncio] pulls greenlet, which sqlalchemy.ext.asyncio (used in
+    # shared/health.py and the db layer) requires at import time. It used to
+    # arrive transitively via the old Kotak SDK's dependency tree; kotakneoapi
+    # doesn't pull it, so declare it where it's actually needed.
+    "sqlalchemy[asyncio]>=2.0",
     "asyncpg>=0.29",
     "structlog>=24.1",
     "fastapi>=0.115",

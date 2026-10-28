@@ -9,5 +9,6 @@ class BaseServiceSettings(BaseSettings):
     log_level: str = "info"
     environment: str = "development"
     service_name: str = "unknown"
+    fmp_api_key: str = ""
 
     model_config = {"env_file": ".env", "extra": "ignore"}

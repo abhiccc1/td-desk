@@ -13,6 +13,13 @@ const FALLBACK: Record<string, number> = {
   MIDCPNIFTY: 50,
   SENSEX: 20,
   BANKEX: 20,
+  // MCX (qty per lot; verified against Kotak mcx_fo scrip master 2026-09-25)
+  CRUDEOIL: 100,
+  CRUDEOILM: 10,
+  NATURALGAS: 1250,
+  NATGASMINI: 250,
+  GOLD: 1,
+  GOLDM: 100,
 };
 
 const DEFAULT_LOT_SIZE = 1;

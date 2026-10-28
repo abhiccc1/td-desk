@@ -52,4 +52,23 @@ export interface Position {
   expiry?: string;
   lotSize?: number;
   tradingSymbol?: string;
+  /** Normalized fields — populated by position store on ingestion */
+  _underlying?: string;
+  _strike?: number;
+  _optionType?: "CE" | "PE";
+  _expiryIso?: string;   // always "YYYY-MM-DD"
+}
+
+/** Real-time order lifecycle event pushed from broker WebSocket via Redis. */
+export interface OrderLifecycleEvent {
+  orderNumber: string;
+  symbol: string;
+  tradingSymbol: string;
+  status: "FILLED" | "PARTIAL_FILL" | "REJECTED" | "CANCELLED";
+  side: OrderSide;
+  totalQty: number;
+  filledQty: number;
+  avgPrice: number;
+  rejectionReason: string;
+  priceType: string;
 }

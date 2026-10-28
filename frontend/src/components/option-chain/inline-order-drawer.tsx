@@ -4,11 +4,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useBasketStore } from "@/stores/basket-store";
 import { useMarketDataStore } from "@/stores/market-data-store";
 import { useGreeksStore } from "@/stores/greeks-store";
-import { analyzeStrategy, cancelOrder, fetchMarginPreview, fetchOrderBook, modifyOrder, placeOrders } from "@/lib/api-client";
+import { usePositionStore } from "@/stores/position-store";
+import { analyzeStrategy, cancelOrder, fetchMarginPreview, fetchOrderBook, modifyOrder, placeOrders, placePaperOrders } from "@/lib/api-client";
+import { toastOrderResults, toastOrderAction, toastOrderError } from "@/lib/order-toast";
 import type { MarginPreviewResult, PlaceOrderLeg } from "@/lib/api-client";
 import type { OrderType as BasketOrderType } from "@/types/market-data";
 import { getLotSize } from "@/lib/lot-sizes";
-import type { OrderType, ProductType, StrategyResult } from "@/types/market-data";
+import type { OrderType, ProductType } from "@/types/market-data";
+import { PortfolioRiskPanel } from "@/components/risk/portfolio-risk-panel";
 import { SpreadDiffsBar, computeSpreadDiffs } from "./spread-diffs-bar";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
@@ -49,6 +52,8 @@ import {
   loadSavedParamValues,
   saveParamValues,
 } from "./strategy-templates";
+import { foSegmentOf, isFuturesUnderlying, legValue, priceTick, SEGMENT_LABELS, segmentOfRow } from "@/lib/instruments";
+import { useSegmentFilter, useSegmentStore } from "@/stores/segment-store";
 import type { StrategyTemplate, ParamValues, StrikeMode } from "./strategy-templates";
 import { StrategyConfigBar } from "./strategy-config-bar";
 
@@ -62,6 +67,8 @@ interface BrokerOrder {
   tradingSymbol?: string;
   symbol?: string;
   exchange?: string;
+  exchangeSegment?: string;
+  instrumentToken?: string;
   side?: string;
   quantity?: number;
   filledQty?: number;
@@ -128,10 +135,14 @@ function NumberStepper({
   disabled?: boolean;
   widthClass?: string;
 }) {
+  // Determine decimal precision from step (e.g. 0.05 → 2 decimals)
+  const precision = Math.max(0, -Math.floor(Math.log10(step || 1)));
+  const round = (n: number) => Number(n.toFixed(precision));
   const clamp = (next: number) => {
     if (Number.isNaN(next)) return min;
-    if (max !== undefined && next > max) return max;
-    return Math.max(min, next);
+    const rounded = round(next);
+    if (max !== undefined && rounded > max) return max;
+    return Math.max(min, rounded);
   };
 
   return (
@@ -154,6 +165,7 @@ function NumberStepper({
           step={step}
           value={value}
           disabled={disabled}
+
           onChange={(e) => onChange(clamp(Number(e.target.value) || 0))}
           className={`h-7 rounded-none border-x-0 border-panel-border bg-panel px-0 text-center text-xs text-panel-muted ${widthClass} ${NO_SPINNER}`}
         />
@@ -202,7 +214,6 @@ export function InlineOrderDrawer({
   const removeLeg = useBasketStore((s) => s.removeLeg);
   const reorderLegs = useBasketStore((s) => s.reorderLegs);
   const clearBasket = useBasketStore((s) => s.clearBasket);
-  const addLeg = useBasketStore((s) => s.addLeg);
 
   const selectedUnderlying = useMarketDataStore((s) => s.selectedUnderlying);
   const selectedExpiry = useMarketDataStore((s) => s.selectedExpiry);
@@ -247,6 +258,20 @@ export function InlineOrderDrawer({
     [legs],
   );
 
+  const greeksVersion = useGreeksStore((s) => s.greeksVersion);
+  const netDelta = useMemo(() => {
+    const greeksMap = useGreeksStore.getState().greeks;
+    let total = 0;
+    for (const leg of legs) {
+      const g = greeksMap.get(leg.symbol);
+      if (!g) continue;
+      const sign = leg.side === "BUY" ? 1 : -1;
+      total += g.delta * leg.quantity * sign;
+    }
+    return total;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [legs, greeksVersion]);
+
   const [basketOrderType, setBasketOrderType] = useState<OrderType>("LIMIT");
   const lots = useBasketStore((s) => s.lots);
   const setLots = useBasketStore((s) => s.setLots);
@@ -255,7 +280,10 @@ export function InlineOrderDrawer({
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
-  const [analysisResult, setAnalysisResult] = useState<StrategyResult | null>(null);
+  const analysisResult = useBasketStore((s) => s.analysisResult);
+  const setAnalysisResult = useBasketStore((s) => s.setAnalysisResult);
+  const paperMode = useBasketStore((s) => s.paperMode);
+  const setPaperMode = useBasketStore((s) => s.setPaperMode);
   const [marginPreview, setMarginPreview] = useState<MarginPreviewResult | null>(null);
   const [marginPreviewError, setMarginPreviewError] = useState<string | null>(null);
   const [isLoadingMarginPreview, setIsLoadingMarginPreview] = useState(false);
@@ -287,27 +315,50 @@ export function InlineOrderDrawer({
     if (legs.length === 0) return;
     setIsAnalyzing(true);
     try {
-      const result = await analyzeStrategy(legs);
+      // Enrich legs with underlying/expiry/spot for RND PoP, VaR, ES
+      const chain = useMarketDataStore.getState().optionChain;
+      const spot = chain?.underlyingPrice ?? 0;
+      const enrichedLegs = legs.map((leg) => ({
+        ...leg,
+        underlying: selectedUnderlying || undefined,
+        expiry: selectedExpiry || undefined,
+        spot: spot > 0 ? spot : undefined,
+      }));
+      const result = await analyzeStrategy(enrichedLegs as typeof legs);
       setAnalysisResult(result);
     } finally {
       setIsAnalyzing(false);
     }
-  }, [legs]);
+  }, [legs, selectedUnderlying, selectedExpiry]);
 
   const orderLegs = useMemo<PlaceOrderLeg[]>(
     () =>
-      legs.map((leg) => ({
-        underlying: selectedUnderlying,
-        expiry: selectedExpiry,
-        strike: leg.strike,
-        optionType: leg.optionType,
-        transactionType: leg.side === "BUY" ? "B" as const : "S" as const,
-        quantity: leg.quantity,
-        orderType: mapOrderType(leg.orderType),
-        product: leg.productType as "NRML" | "MIS",
-        price: leg.orderType === "LIMIT" || leg.orderType === "SL" ? leg.premium : 0,
-        triggerPrice: leg.orderType === "SL" || leg.orderType === "SL-M" ? leg.premium : 0,
-      })),
+      legs.map((leg) => {
+        // Parse underlying/expiry from leg symbol (e.g. "NIFTY 260319 22000 CE")
+        // Falls back to toolbar selection for chain-added legs
+        const parts = leg.symbol.split(" ");
+        const legUnderlying = parts.length >= 4 ? parts[0] : selectedUnderlying;
+        let legExpiry = selectedExpiry;
+        if (parts.length >= 4 && parts[1].length === 6) {
+          // "260319" → "2026-03-19"
+          const yy = parts[1].slice(0, 2);
+          const mm = parts[1].slice(2, 4);
+          const dd = parts[1].slice(4, 6);
+          legExpiry = `20${yy}-${mm}-${dd}`;
+        }
+        return {
+          underlying: legUnderlying,
+          expiry: legExpiry,
+          strike: leg.strike,
+          optionType: leg.optionType,
+          transactionType: leg.side === "BUY" ? "B" as const : "S" as const,
+          quantity: leg.quantity,
+          orderType: mapOrderType(leg.orderType),
+          product: leg.productType as "NRML" | "MIS",
+          price: leg.orderType === "LIMIT" || leg.orderType === "SL" ? leg.premium : 0,
+          triggerPrice: leg.orderType === "SL" || leg.orderType === "SL-M" ? leg.premium : 0,
+        };
+      }),
     [legs, selectedUnderlying, selectedExpiry],
   );
 
@@ -316,34 +367,26 @@ export function InlineOrderDrawer({
     setIsSubmitting(true);
     setSubmitError(null);
     try {
-      const results = await placeOrders(orderLegs);
+      // PAPER mode routes to the fully-isolated paper endpoint — it can never
+      // reach the live broker. LIVE mode is the default.
+      const results = paperMode
+        ? await placePaperOrders(orderLegs)
+        : await placeOrders(orderLegs);
+      toastOrderResults(results, paperMode ? "Paper strategy" : "Strategy");
       const failures = results.filter((r) => !r.success);
       if (failures.length > 0) {
         setSubmitError(failures.map((f) => `Leg ${f.index + 1}: ${f.error}`).join("; "));
       } else {
         clearBasket();
-        // Refresh order book if on that tab
         ordersFetchedRef.current = false;
       }
     } catch (error) {
+      toastOrderError("Order placement", error);
       setSubmitError(error instanceof Error ? error.message : "Order placement failed");
     } finally {
       setIsSubmitting(false);
     }
-  }, [clearBasket, legs.length, orderLegs]);
-
-  const handleAddLeg = useCallback(() => {
-    addLeg({
-      symbol: "",
-      strike: 0,
-      optionType: "CE",
-      side: "BUY",
-      quantity: lotSize * lots,
-      premium: 0,
-      orderType: basketOrderType,
-      productType,
-    });
-  }, [addLeg, lotSize, lots, basketOrderType, productType]);
+  }, [clearBasket, legs.length, orderLegs, paperMode]);
 
   const handleBasketOrderTypeChange = useCallback(
     (newType: OrderType) => {
@@ -399,8 +442,9 @@ export function InlineOrderDrawer({
         if (!strikeRow) return; // don't step beyond available strikes
         const opt = leg.optionType === "CE" ? strikeRow.call : strikeRow.put;
         const premium = opt ? opt.ltp : leg.premium;
-        const expiryCompact = selectedExpiry.replace(/-/g, "");
-        const symbol = `${selectedUnderlying}${expiryCompact}${newStrike}${leg.optionType}`;
+        // Same "U YYMMDD K CE" cache-symbol format as the rest of the basket
+        const expiryCompact = selectedExpiry.replace(/-/g, "").slice(2);
+        const symbol = `${selectedUnderlying} ${expiryCompact} ${newStrike} ${leg.optionType}`;
         updateLeg(index, { strike: newStrike, premium, symbol });
       } else {
         updateLeg(index, { strike: newStrike });
@@ -433,7 +477,7 @@ export function InlineOrderDrawer({
     () =>
       legs.reduce(
         (total, leg) =>
-          leg.side === "BUY" ? total + leg.quantity * leg.premium : total,
+          leg.side === "BUY" ? total + legValue(leg.symbol, leg.premium, leg.quantity) : total,
         0,
       ),
     [legs],
@@ -442,7 +486,7 @@ export function InlineOrderDrawer({
     () =>
       legs.reduce(
         (total, leg) =>
-          leg.side === "SELL" ? total + leg.quantity * leg.premium : total,
+          leg.side === "SELL" ? total + legValue(leg.symbol, leg.premium, leg.quantity) : total,
         0,
       ),
     [legs],
@@ -454,7 +498,6 @@ export function InlineOrderDrawer({
     () => estimateExecutionCharges(turnover, legs.length),
     [turnover, legs.length],
   );
-  const estimatedMarginBlock = analysisResult?.margin.initialMargin ?? null;
   const fundsRequired = analysisResult
     ? Math.max(analysisResult.margin.initialMargin - Math.max(premiumFlow, 0), 0)
     : hasShortExposure
@@ -498,9 +541,26 @@ export function InlineOrderDrawer({
     }
   }, [feedMode, orderLegs, selectedExpiry, selectedUnderlying]);
 
-  const [activeTab, setActiveTab] = useState<"new" | "open" | "closed">("new");
-  const [openOrders, setOpenOrders] = useState<BrokerOrder[]>([]);
-  const [closedOrders, setClosedOrders] = useState<BrokerOrder[]>([]);
+  const [activeTab, setActiveTab] = useState<"new" | "risk" | "open" | "closed">("new");
+  const [allOpenOrders, setOpenOrders] = useState<BrokerOrder[]>([]);
+  const [allClosedOrders, setClosedOrders] = useState<BrokerOrder[]>([]);
+  // NSE+BSE / MCX toggle filters the order book; hidden rows are counted.
+  const segmentFilter = useSegmentFilter();
+  const setSegment = useSegmentStore((s) => s.setSegment);
+  const orderInSegment = useCallback(
+    (o: BrokerOrder) =>
+      !segmentFilter.active
+      || segmentOfRow({
+        exchange: o.exchangeSegment || o.exchange,
+        symbol: o.symbol,
+        tradingSymbol: o.tradingSymbol,
+      }) === segmentFilter.segment,
+    [segmentFilter.active, segmentFilter.segment],
+  );
+  const openOrders = useMemo(() => allOpenOrders.filter(orderInSegment), [allOpenOrders, orderInSegment]);
+  const closedOrders = useMemo(() => allClosedOrders.filter(orderInSegment), [allClosedOrders, orderInSegment]);
+  const hiddenOpenOrders = allOpenOrders.length - openOrders.length;
+  const otherSegment = segmentFilter.segment === "MCX" ? "EQ_IDX" : "MCX";
   const [ordersError, setOrdersError] = useState<string | null>(null);
   const [refreshingOrders, setRefreshingOrders] = useState(false);
   const [actingOrderId, setActingOrderId] = useState<string | null>(null);
@@ -520,6 +580,7 @@ export function InlineOrderDrawer({
     }
   }, []);
 
+  // Auto-fetch order book when switching to Open/Closed tab
   useEffect(() => {
     if (activeTab === "new") return;
     if (ordersFetchedRef.current) return;
@@ -527,13 +588,22 @@ export function InlineOrderDrawer({
     void refreshOrders();
   }, [activeTab, refreshOrders]);
 
+  // Auto-refresh order book when a position/order update arrives via WS
+  const orderUpdateVersion = usePositionStore((s) => s.orderUpdateVersion);
+  useEffect(() => {
+    if (!ordersFetchedRef.current) return; // don't fetch before first manual open
+    void refreshOrders();
+  }, [orderUpdateVersion, refreshOrders]);
+
   const handleCancelOrder = useCallback(async (orderId: string) => {
     setActingOrderId(orderId);
     setOrdersError(null);
     try {
       await cancelOrder(orderId);
+      toastOrderAction("Cancelled", orderId);
       await refreshOrders();
     } catch (error) {
+      toastOrderError("Cancel order", error);
       setOrdersError(error instanceof Error ? error.message : `Unable to cancel order ${orderId}`);
     } finally {
       setActingOrderId(null);
@@ -543,12 +613,18 @@ export function InlineOrderDrawer({
   const handleModifyOrder = useCallback(async (
     orderId: string,
     payload: {
-      quantity: number;
+      quantity?: number;
+      lots?: number;
       price: number;
       trigger_price: number;
       disclosed_quantity: number;
       validity: string;
       order_type: string;
+      trading_symbol: string;
+      transaction_type: string;
+      exchange_segment?: string;
+      product: string;
+      instrument_token: string;
     },
   ) => {
     setActingOrderId(orderId);
@@ -556,14 +632,22 @@ export function InlineOrderDrawer({
     try {
       await modifyOrder(orderId, {
         quantity: payload.quantity,
+        lots: payload.lots,
         price: payload.price,
         trigger_price: payload.trigger_price,
         order_type: payload.order_type,
         disclosed_quantity: payload.disclosed_quantity,
         validity: payload.validity,
+        trading_symbol: payload.trading_symbol,
+        transaction_type: payload.transaction_type,
+        exchange_segment: payload.exchange_segment,
+        product: payload.product,
+        instrument_token: payload.instrument_token,
       });
+      toastOrderAction("Modified", orderId);
       await refreshOrders();
     } catch (error) {
+      toastOrderError("Modify order", error);
       setOrdersError(error instanceof Error ? error.message : `Unable to modify order ${orderId}`);
       throw error;
     } finally {
@@ -597,15 +681,15 @@ export function InlineOrderDrawer({
 
   // Expanded — always show full UI
   return (
-    <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as "new" | "open" | "closed")} className="flex h-full flex-col bg-panel-header">
+    <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as "new" | "risk" | "open" | "closed")} className="flex h-full flex-col bg-panel-header">
       {/* Tab bar */}
       <div className="flex shrink-0 items-center border-b border-panel-border">
         <TabsList
           variant="line"
           className="h-auto gap-0 rounded-none border-none bg-transparent p-0"
         >
-          {(["new", "open", "closed"] as const).map((tab) => {
-            const count = tab === "new" ? legs.length : tab === "open" ? openOrders.length : closedOrders.length;
+          {(["new", "risk", "open", "closed"] as const).map((tab) => {
+            const count = tab === "new" ? legs.length : tab === "open" ? openOrders.length : tab === "closed" ? closedOrders.length : 0;
             const isActive = activeTab === tab;
             return (
               <TabsTrigger
@@ -613,7 +697,7 @@ export function InlineOrderDrawer({
                 value={tab}
                 className="flex items-center gap-1.5 rounded-none border-x-0 border-t-0 border-b-2 border-transparent px-4 py-2 text-xs font-medium text-panel-faint transition-colors hover:text-panel-muted data-active:border-blue-500 data-active:bg-transparent data-active:text-panel-muted data-active:shadow-none data-active:after:bg-blue-500 dark:data-active:border-blue-500 dark:data-active:bg-transparent"
               >
-                {tab === "new" ? "New" : tab === "open" ? "Open" : "Closed"}
+                {tab === "new" ? "New" : tab === "risk" ? "Risk" : tab === "open" ? "Open" : "Closed"}
                 {count > 0 && (
                   <Badge
                     variant="secondary"
@@ -697,6 +781,18 @@ export function InlineOrderDrawer({
           />
         </div>
 
+        {legs.length > 0 && (
+          <>
+            <div className="h-3 w-px bg-panel-border" />
+            <span className="text-[11px] text-panel-quiet">
+              Net &Delta;{" "}
+              <span className={`font-semibold ${netDelta > 0 ? "text-green-400" : netDelta < 0 ? "text-red-400" : "text-panel-muted"}`}>
+                {netDelta >= 0 ? "+" : ""}{netDelta.toFixed(1)}
+              </span>
+            </span>
+          </>
+        )}
+
         <div className="ml-auto flex items-center gap-1.5">
           <div className="flex items-center">
             <Button
@@ -713,6 +809,7 @@ export function InlineOrderDrawer({
               value={lots}
               min={1}
               max={100}
+    
               onChange={(e) => setLots(Number(e.target.value) || 1)}
               className="h-6 w-10 rounded-none border-x-0 border-panel-border bg-panel px-0 text-center text-xs text-panel-muted [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
               title="Lots"
@@ -787,12 +884,6 @@ export function InlineOrderDrawer({
             </div>
           </div>
           <div className="bg-panel-inset px-3 py-2">
-            <div className="text-[10px] uppercase tracking-wider text-panel-dim">Strategy Margin</div>
-            <div className="mt-1 text-sm font-semibold text-panel-muted">
-              {estimatedMarginBlock !== null ? formatAmount(estimatedMarginBlock) : "Run Analyze"}
-            </div>
-          </div>
-          <div className="bg-panel-inset px-3 py-2">
             <div className="text-[10px] uppercase tracking-wider text-panel-dim">Shortfall</div>
             <div className={`mt-1 text-sm font-semibold ${brokerInsufficientFund !== null && brokerInsufficientFund > 0 ? "text-red-400" : "text-green-400"}`}>
               {isLoadingMarginPreview
@@ -845,22 +936,6 @@ export function InlineOrderDrawer({
               {formatAmount(estimatedCharges)}
             </div>
           </div>
-          <div className="bg-panel-inset px-3 py-2">
-            <div className="flex items-center justify-between text-[10px] uppercase tracking-wider text-panel-dim">
-              Review
-              <Badge
-                variant="secondary"
-                className={analysisResult ? "bg-green-500/15 text-green-400" : "bg-yellow-500/15 text-yellow-400"}
-              >
-                {analysisResult ? "Analyzed" : "Draft"}
-              </Badge>
-            </div>
-            <div className="mt-1 text-xs text-panel-subtle">
-              {analysisResult
-                ? `Max loss ${formatAmount(analysisResult.maxLoss)}`
-                : "Local estimate vs broker preview."}
-            </div>
-          </div>
         </div>
       )}
 
@@ -877,16 +952,30 @@ export function InlineOrderDrawer({
       {/* Action bar — always at bottom */}
       <div className="order-action-bar flex shrink-0 items-center justify-between border-t border-panel-border px-3 py-2">
         <div className="flex items-center gap-1.5">
-          <Button variant="secondary" size="xs" onClick={handleAddLeg}>
-            + Leg
+          {/* LIVE / PAPER mode toggle. PAPER routes orders to the isolated
+              paper endpoint that can never reach the live broker. */}
+          <Button
+            variant="outline"
+            size="xs"
+            onClick={() => setPaperMode(!paperMode)}
+            title={paperMode
+              ? "PAPER mode — orders are simulated, not sent to the broker. Click for LIVE."
+              : "LIVE mode — orders go to the real broker. Click for PAPER (simulated)."}
+            className={paperMode
+              ? "border-amber-500/60 bg-amber-500/15 font-semibold text-amber-400 hover:bg-amber-500/25"
+              : "border-green-600/50 font-semibold text-green-400 hover:bg-green-600/15"}
+          >
+            {paperMode ? "PAPER" : "LIVE"}
           </Button>
           <Button variant="outline" size="xs" onClick={handleAnalyze} disabled={isAnalyzing || legs.length === 0}
             className="border-blue-600/40 text-blue-400 hover:bg-blue-600/20">
             {isAnalyzing ? "..." : "Analyze"}
           </Button>
           <Button size="xs" onClick={handleSubmit} disabled={isSubmitting || legs.length === 0}
-            className="bg-green-600 text-white hover:bg-green-700">
-            {isSubmitting ? "Placing..." : "Submit"}
+            className={paperMode
+              ? "bg-amber-600 text-white hover:bg-amber-700"
+              : "bg-green-600 text-white hover:bg-green-700"}>
+            {isSubmitting ? "Placing..." : paperMode ? "Paper Submit" : "Submit"}
           </Button>
           <Button variant="ghost" size="xs" onClick={clearBasket} disabled={legs.length === 0}
             className="text-red-400 hover:bg-red-500/20 hover:text-red-400">
@@ -894,20 +983,27 @@ export function InlineOrderDrawer({
           </Button>
         </div>
 
-        <div className="flex items-center gap-3">
-          {legs.length > 0 && (
-            <span className={`text-sm font-medium ${creditColor}`}>
-              {Math.abs(netCredit).toFixed(2)} {creditLabel}
-            </span>
-          )}
-        </div>
       </div>
+      </TabsContent>
+
+      <TabsContent value="risk" className="mt-0 min-h-0 flex-1 overflow-hidden">
+        <PortfolioRiskPanel mode="basket" />
       </TabsContent>
 
       <TabsContent value="open" className="mt-0 min-h-0 flex-1 overflow-y-auto">
         <div className="flex items-center justify-between border-b border-panel-border/40 px-3 py-2 text-[11px]">
           <span className="text-panel-subtle">
             {ordersError ? ordersError : refreshingOrders ? "Refreshing orders..." : "Pending broker orders"}
+            {hiddenOpenOrders > 0 && (
+              <button
+                type="button"
+                onClick={() => setSegment(otherSegment)}
+                className="ml-2 text-blue-400/80 underline-offset-2 hover:underline"
+                title="Orders in the other segment are hidden by the NSE+BSE / MCX toggle"
+              >
+                +{hiddenOpenOrders} pending in {SEGMENT_LABELS[otherSegment]}
+              </button>
+            )}
           </span>
           <Button variant="ghost" size="xs" onClick={() => void refreshOrders()} disabled={refreshingOrders}>
             Refresh
@@ -961,12 +1057,18 @@ function OrderRow({
   onModify?: (
     orderId: string,
     payload: {
-      quantity: number;
+      quantity?: number;
+      lots?: number;
       price: number;
       trigger_price: number;
       disclosed_quantity: number;
       validity: string;
       order_type: string;
+      trading_symbol: string;
+      transaction_type: string;
+      exchange_segment?: string;
+      product: string;
+      instrument_token: string;
     },
   ) => void | Promise<void>;
 }) {
@@ -984,12 +1086,19 @@ function OrderRow({
   const symbol = String(order.symbol || "");
   const tradingSymbol = String(order.tradingSymbol || symbol);
   const exchange = String(order.exchange || "");
+  // Never default to nse_fo: an MCX order modified as nse_fo would be rejected
+  // (or worse). Unknown → omitted, and the backend derives it.
+  const exchangeSegment = foSegmentOf(String(order.exchangeSegment || "")) ?? foSegmentOf(String(order.exchange || ""));
+  const instrumentToken = String(order.instrumentToken || "");
   const productType = String(order.productType || "");
   const strike = String(order.strikePrice || "");
   const time = String(order.time || "");
   const orderId = String(order.orderId || "");
   const triggerPrice = Number(order.triggerPrice || 0);
   const expiryLabel = formatExpiryBadge(order.expiry);
+  const underlying = tradingSymbol.replace(/\d.*/, "") || symbol.replace(/\d.*/, "");
+  const lotSize = getLotSize(underlying) || 1;
+  const qtyInLots = isFuturesUnderlying(underlying);
   const [editing, setEditing] = useState(false);
   const [draftQty, setDraftQty] = useState(total);
   const [draftPrice, setDraftPrice] = useState(price);
@@ -1032,12 +1141,18 @@ function OrderRow({
     }
     setLocalError(null);
     await onModify(orderId, {
-      quantity: draftQty,
+      // MCX: send lots and let the backend convert with its lot size
+      ...(qtyInLots ? { lots: Math.round(draftQty / lotSize) } : { quantity: draftQty }),
       price: draftOrderType === "MKT" || draftOrderType === "SL-M" ? 0 : draftPrice,
       trigger_price: draftOrderType === "SL" || draftOrderType === "SL-M" ? draftTriggerPrice : 0,
       disclosed_quantity: draftDisclosedQty,
       validity: draftValidity,
       order_type: draftOrderType,
+      trading_symbol: tradingSymbol,
+      transaction_type: side === "BUY" ? "B" : "S",
+      exchange_segment: exchangeSegment,
+      product: productType || "NRML",
+      instrument_token: instrumentToken,
     });
     setEditing(false);
   };
@@ -1152,18 +1267,18 @@ function OrderRow({
           </div>
           <div className="flex flex-wrap items-end gap-2">
             <NumberStepper
-              label="Qty"
-              value={draftQty}
-              onChange={setDraftQty}
-              step={1}
-              min={1}
+              label={qtyInLots ? "Lots" : "Qty"}
+              value={qtyInLots ? Math.round(draftQty / lotSize) : draftQty}
+              onChange={(v) => setDraftQty(qtyInLots ? v * lotSize : v)}
+              step={qtyInLots ? 1 : lotSize}
+              min={qtyInLots ? 1 : lotSize}
               widthClass="w-20"
             />
             <NumberStepper
               label="Price"
               value={draftPrice}
               onChange={setDraftPrice}
-              step={0.05}
+              step={priceTick(underlying)}
               min={0}
               disabled={draftOrderType === "MKT" || draftOrderType === "SL-M"}
             />
@@ -1171,7 +1286,7 @@ function OrderRow({
               label="Trigger"
               value={draftTriggerPrice}
               onChange={setDraftTriggerPrice}
-              step={0.05}
+              step={priceTick(underlying)}
               min={0}
               disabled={draftOrderType !== "SL" && draftOrderType !== "SL-M"}
             />
@@ -1186,6 +1301,9 @@ function OrderRow({
           </div>
           <div className="flex items-center gap-2">
             {localError && <span className="text-[11px] text-red-400">{localError}</span>}
+            <Button size="xs" onClick={() => void submitModify()} disabled={isBusy}>
+              {isBusy ? "..." : "Save"}
+            </Button>
             <Button
               variant="outline"
               size="xs"
@@ -1202,9 +1320,6 @@ function OrderRow({
               disabled={isBusy}
             >
               Reset
-            </Button>
-            <Button size="xs" onClick={() => void submitModify()} disabled={isBusy}>
-              {isBusy ? "..." : "Save"}
             </Button>
           </div>
         </div>

@@ -10,6 +10,7 @@ import {
   lazy,
 } from "react";
 
+import { daysToExpiryFor, timeToExpiryYears } from "@/lib/instruments";
 import { useMarketDataStore } from "@/stores/market-data-store";
 import { getConfig } from "@/lib/config";
 import type { SviParams } from "@/types/market-data";
@@ -62,10 +63,8 @@ function ivToColor(iv: number, minIv: number, maxIv: number): string {
   return `rgb(${r},${g},${b})`;
 }
 
-function daysToExpiry(expiryStr: string): number {
-  const now = Date.now();
-  const exp = new Date(expiryStr + "T15:30:00+05:30").getTime();
-  return Math.max(1, Math.ceil((exp - now) / 86400_000));
+function daysToExpiry(expiryStr: string, underlying?: string): number {
+  return daysToExpiryFor(underlying, expiryStr);
 }
 
 // ─── Shared grid builder ────────────────────────────────────────────
@@ -75,19 +74,22 @@ function buildGrid(
   spot: number,
 ): VolSurfaceGridData | null {
   if (!sviSurface.length || spot <= 0) return null;
+  const underlying = sviSurface[0].underlying;
 
   const strikeMin = Math.round(spot * 0.9);
   const strikeMax = Math.round(spot * 1.1);
-  const strikeStep = Math.max(50, Math.round((strikeMax - strikeMin) / 40));
+  // ~40 columns across ±10%; the old 50-point floor left NATURALGAS (~300)
+  // with two strikes. Index spots are large enough that this is unchanged.
+  const strikeStep = Math.max(1, Math.round((strikeMax - strikeMin) / 40));
   const strikes: number[] = [];
   for (let s = strikeMin; s <= strikeMax; s += strikeStep) strikes.push(s);
 
   const expiries = sviSurface
     .map((s) => s.expiry)
-    .filter((e) => daysToExpiry(e) > 0)
+    .filter((e) => daysToExpiry(e, underlying) > 0)
     .sort();
 
-  const dtes = expiries.map(daysToExpiry);
+  const dtes = expiries.map((e) => daysToExpiry(e, underlying));
 
   const ivs: (number | null)[][] = [];
   let minIv = Infinity;
@@ -95,8 +97,8 @@ function buildGrid(
 
   for (const expiry of expiries) {
     const svi = sviSurface.find((s) => s.expiry === expiry);
-    const dte = daysToExpiry(expiry);
-    const t = Math.max(dte / 365, 1e-6);
+    // Continuous T with the same expiry close as the quant service's SVI fit
+    const t = timeToExpiryYears(underlying, expiry);
     const row: (number | null)[] = [];
     for (const strike of strikes) {
       const iv = svi ? sviIvAt(svi, strike, spot, t) : null;
@@ -143,15 +145,123 @@ function Heatmap2D({
     if (!ctx) return;
     ctx.scale(dpr, dpr);
 
+    ctx.fillStyle = "#1a1a2e";
+    ctx.fillRect(0, 0, width, height);
+
+    // ── Single-expiry: render as IV smile line chart ──
+    if (expiries.length === 1) {
+      const margin = { top: 30, right: 15, bottom: 40, left: 55 };
+      const innerW = width - margin.left - margin.right;
+      const innerH = height - margin.top - margin.bottom;
+      const row = ivs[0];
+      const validIvs = row.filter((v): v is number => v !== null);
+      if (validIvs.length === 0) return;
+      const lo = Math.min(...validIvs) * 0.9;
+      const hi = Math.max(...validIvs) * 1.1;
+      const range = hi - lo || 1;
+
+      const xOf = (i: number) => margin.left + (i / (strikes.length - 1)) * innerW;
+      const yOf = (iv: number) => margin.top + (1 - (iv - lo) / range) * innerH;
+
+      // Gradient fill under curve
+      const gradient = ctx.createLinearGradient(0, margin.top, 0, margin.top + innerH);
+      gradient.addColorStop(0, "rgba(96,165,250,0.25)");
+      gradient.addColorStop(1, "rgba(96,165,250,0.02)");
+      ctx.beginPath();
+      let started = false;
+      for (let i = 0; i < row.length; i++) {
+        if (row[i] === null) continue;
+        const x = xOf(i), y = yOf(row[i]!);
+        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+      }
+      // Close to bottom for fill
+      for (let i = row.length - 1; i >= 0; i--) {
+        if (row[i] !== null) { ctx.lineTo(xOf(i), margin.top + innerH); break; }
+      }
+      for (let i = 0; i < row.length; i++) {
+        if (row[i] !== null) { ctx.lineTo(xOf(i), margin.top + innerH); break; }
+      }
+      ctx.closePath();
+      ctx.fillStyle = gradient;
+      ctx.fill();
+
+      // IV line
+      ctx.beginPath();
+      started = false;
+      for (let i = 0; i < row.length; i++) {
+        if (row[i] === null) continue;
+        const x = xOf(i), y = yOf(row[i]!);
+        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+      }
+      ctx.strokeStyle = "#60a5fa";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // Color dots at each strike
+      for (let i = 0; i < row.length; i++) {
+        if (row[i] === null) continue;
+        ctx.beginPath();
+        ctx.arc(xOf(i), yOf(row[i]!), 3, 0, Math.PI * 2);
+        ctx.fillStyle = ivToColor(row[i]!, minIv, maxIv);
+        ctx.fill();
+      }
+
+      // Spot marker
+      if (spot > 0 && spot >= strikes[0] && spot <= strikes[strikes.length - 1]) {
+        const spotFrac = (spot - strikes[0]) / (strikes[strikes.length - 1] - strikes[0]);
+        const spotX = margin.left + spotFrac * innerW;
+        ctx.strokeStyle = "rgba(250,204,21,0.6)";
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.moveTo(spotX, margin.top);
+        ctx.lineTo(spotX, margin.top + innerH);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      // Y-axis labels (IV%)
+      ctx.fillStyle = "#808090";
+      ctx.font = "10px sans-serif";
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      const yTicks = 5;
+      for (let j = 0; j <= yTicks; j++) {
+        const iv = lo + (range * j) / yTicks;
+        const y = yOf(iv);
+        ctx.fillText(`${iv.toFixed(0)}%`, margin.left - 6, y);
+        // grid line
+        ctx.strokeStyle = "rgba(128,128,144,0.15)";
+        ctx.beginPath();
+        ctx.moveTo(margin.left, y);
+        ctx.lineTo(margin.left + innerW, y);
+        ctx.stroke();
+      }
+
+      // X-axis labels (strikes)
+      ctx.fillStyle = "#808090";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "top";
+      const xStep = Math.max(1, Math.floor(strikes.length / 8));
+      for (let i = 0; i < strikes.length; i += xStep) {
+        ctx.fillText(String(strikes[i]), xOf(i), margin.top + innerH + 4);
+      }
+
+      // Title
+      ctx.fillStyle = "#606070";
+      ctx.font = "10px sans-serif";
+      ctx.textAlign = "left";
+      const dte = daysToExpiry(expiries[0]);
+      ctx.fillText(`IV Smile — ${expiries[0]} (${dte}d)`, margin.left, 12);
+      return;
+    }
+
+    // ── Multi-expiry: standard heatmap ──
     const margin = { top: 10, right: 10, bottom: 35, left: 55 };
     const innerW = width - margin.left - margin.right;
     const innerH = height - margin.top - margin.bottom;
 
     const cellW = innerW / strikes.length;
     const cellH = innerH / expiries.length;
-
-    ctx.fillStyle = "#1a1a2e";
-    ctx.fillRect(0, 0, width, height);
 
     for (let row = 0; row < expiries.length; row++) {
       for (let col = 0; col < strikes.length; col++) {
@@ -285,6 +395,10 @@ export function VolSurface() {
   }, [underlying]);
 
   const grid = useMemo(() => buildGrid(sviSurface, spot), [sviSurface, spot]);
+  const can3d = grid != null && grid.expiries.length >= 2;
+
+  // Auto-fallback to 2D if 3D selected but not enough expiries
+  const effectiveMode = mode === "3d" && !can3d ? "2d" : mode;
 
   return (
     <div className="flex h-full flex-col bg-[#1a1a2e]">
@@ -293,14 +407,14 @@ export function VolSurface() {
           {underlying || "\u2014"} — Volatility Surface
           {grid && (
             <span className="ml-1">
-              ({grid.expiries.length} expiries × {grid.strikes.length} strikes)
+              ({grid.expiries.length} expir{grid.expiries.length === 1 ? "y" : "ies"} × {grid.strikes.length} strikes)
             </span>
           )}
         </span>
         <div className="ml-auto flex rounded border border-[#2a2a4a] text-[10px] overflow-hidden">
           <button
             className={`px-2 py-0.5 transition-colors ${
-              mode === "2d"
+              effectiveMode === "2d"
                 ? "bg-[#2a2a4a] text-white"
                 : "text-[#808090] hover:text-white"
             }`}
@@ -309,12 +423,16 @@ export function VolSurface() {
             2D
           </button>
           <button
+            disabled={!can3d}
+            title={can3d ? "3D Surface" : "Need 2+ expiries for 3D"}
             className={`px-2 py-0.5 transition-colors ${
-              mode === "3d"
+              effectiveMode === "3d"
                 ? "bg-[#2a2a4a] text-white"
-                : "text-[#808090] hover:text-white"
+                : can3d
+                  ? "text-[#808090] hover:text-white"
+                  : "text-[#404050] cursor-not-allowed"
             }`}
-            onClick={() => setMode("3d")}
+            onClick={() => can3d && setMode("3d")}
           >
             3D
           </button>
@@ -322,7 +440,7 @@ export function VolSurface() {
       </div>
 
       {grid ? (
-        mode === "2d" ? (
+        effectiveMode === "2d" ? (
           <Heatmap2D grid={grid} spot={spot} />
         ) : (
           <div className="min-h-0 flex-1">
@@ -342,7 +460,7 @@ export function VolSurface() {
           </div>
         )
       ) : (
-        <div className="flex min-h-0 flex-1 items-center justify-center text-xs text-[#606070]">
+        <div className="flex min-h-0 flex-1 items-center justify-center text-xs text-panel-subtle">
           No surface data
         </div>
       )}

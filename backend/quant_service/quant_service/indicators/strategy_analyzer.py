@@ -9,11 +9,12 @@ import math
 import structlog
 import td_core
 
+from shared.instruments import pricing_model, unit_multiplier
 from shared.redis_client import cache_get
 from shared.schemas.events import EventType, RedisEvent
 from shared.schemas.strategy import MarginInfo, StrategyLeg, StrategyResult
 
-from quant_service.indicators.registry import IndicatorBase, register
+from quant_service.indicators.registry import TIER_ALWAYS, IndicatorBase, register
 
 log = structlog.get_logger()
 
@@ -25,14 +26,17 @@ def _svi_fair_premium(
     t: float,
     r: float,
     is_call: bool,
+    underlying: str | None = None,
 ) -> float | None:
-    """Compute a fair premium from SVI-fitted IV + BSM pricing."""
+    """Compute a fair premium from SVI-fitted IV + BSM (or Black-76 for MCX) pricing."""
     if underlying_price <= 0 or strike <= 0 or t <= 0:
         return None
     k = math.log(strike / underlying_price)
     iv = td_core.svi_iv(svi_params, k, t)
     if iv <= 0:
         return None
+    if pricing_model(underlying) == "black76":
+        return td_core.black76_price(underlying_price, strike, t, r, iv, is_call)
     return td_core.bs_price(underlying_price, strike, t, r, iv, is_call)
 
 
@@ -71,7 +75,7 @@ def _analyze(
     return payoff_x, payoff_y, breakevens
 
 
-@register([EventType.ORDER_COMMAND])
+@register([EventType.ORDER_COMMAND], tier=TIER_ALWAYS)
 class StrategyAnalyzer(IndicatorBase):
     """Analyze a multi-leg options strategy for margin, breakeven, and PoP."""
 
@@ -105,6 +109,7 @@ class StrategyAnalyzer(IndicatorBase):
                     is_call = leg.option_type == "C"
                     fair = _svi_fair_premium(
                         svi_params, leg.strike, underlying_price, t, risk_free_rate, is_call,
+                        underlying=underlying,
                     )
                     if fair is not None and fair > 0:
                         leg.premium = round(fair, 2)
@@ -117,6 +122,10 @@ class StrategyAnalyzer(IndicatorBase):
             payoff_x, payoff_y, breakeven_points = _analyze(
                 legs, underlying_price, days_to_expiry,
             )
+            # Rupee values: ₹ per unit qty per ₹1 price (GOLD 100, GOLDM 0.1, else 1)
+            value_mult = unit_multiplier(underlying)
+            if value_mult != 1.0:
+                payoff_y = [y * value_mult for y in payoff_y]
             # PoP estimate: fraction of payoff > 0
             probability_of_profit = (
                 sum(1 for y in payoff_y if y > 0) / len(payoff_y)
@@ -124,7 +133,7 @@ class StrategyAnalyzer(IndicatorBase):
                 else 0.0
             )
 
-            net_credit = sum(
+            net_credit = value_mult * sum(
                 leg.premium * leg.quantity * (1 if leg.side == "SELL" else -1)
                 for leg in legs
             )
@@ -133,7 +142,7 @@ class StrategyAnalyzer(IndicatorBase):
             max_loss = min(payoff_y) if payoff_y else None
 
             # Estimate margin (simplified)
-            total_premium_sold = sum(
+            total_premium_sold = value_mult * sum(
                 leg.premium * leg.quantity for leg in legs if leg.side == "SELL"
             )
             initial_margin = max(abs(max_loss), 0.0) if max_loss is not None else total_premium_sold

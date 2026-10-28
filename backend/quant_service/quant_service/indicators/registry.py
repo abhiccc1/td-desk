@@ -31,16 +31,33 @@ class IndicatorBase(ABC):
 # Registry internals
 # ---------------------------------------------------------------------------
 
-_indicators: dict[EventType, list[IndicatorBase]] = defaultdict(list)
+# Analytics tiers. An indicator belongs to exactly one; a snapshot carries the
+# set of tiers its consumers asked for, and only those indicators run.
+#
+#   greeks — IV solve, the Greeks strip, the SVI fit and its alerts, and VRP
+#            (which reads the SVI fit and shows in the always-visible toolbar).
+#   models — Heston/VG calibration, FFT chain pricing, densities and PoP.
+#
+# TIER_ALWAYS marks work that isn't driven by chain demand at all (OHLCV
+# aggregation off raw ticks), so it never gets filtered out.
+TIER_GREEKS = "greeks"
+TIER_MODELS = "models"
+TIER_ALWAYS = "always"
+
+ALL_TIERS: frozenset[str] = frozenset({TIER_GREEKS, TIER_MODELS})
+
+_indicators: dict[EventType, list[tuple[IndicatorBase, str]]] = defaultdict(list)
 
 
-def register(event_types: list[EventType]) -> Callable[[type[T]], type[T]]:
+def register(
+    event_types: list[EventType], tier: str = TIER_GREEKS
+) -> Callable[[type[T]], type[T]]:
     """Class decorator that instantiates an indicator and registers it for
-    the given event types.
+    the given event types under an analytics *tier*.
 
     Usage::
 
-        @register([EventType.TICK])
+        @register([EventType.TICK], tier=TIER_ALWAYS)
         class MyIndicator(IndicatorBase):
             async def compute(self, event):
                 ...
@@ -49,12 +66,26 @@ def register(event_types: list[EventType]) -> Callable[[type[T]], type[T]]:
     def decorator(cls: type[T]) -> type[T]:
         instance = cls()
         for et in event_types:
-            _indicators[et].append(instance)
+            _indicators[et].append((instance, tier))
         return cls
 
     return decorator
 
 
-def get_indicators(event_type: EventType) -> list[IndicatorBase]:
-    """Return all indicators registered for *event_type*."""
-    return _indicators.get(event_type, [])
+def get_indicators(
+    event_type: EventType, tiers: frozenset[str] | None = None
+) -> list[IndicatorBase]:
+    """Indicators registered for *event_type*, limited to the given tiers.
+
+    `tiers=None` means the event stated no preference, so everything runs —
+    the same fail-toward-full rule the rest of the demand path uses. TIER_ALWAYS
+    indicators are never filtered.
+    """
+    registered = _indicators.get(event_type, [])
+    if tiers is None:
+        return [indicator for indicator, _ in registered]
+    return [
+        indicator
+        for indicator, tier in registered
+        if tier == TIER_ALWAYS or tier in tiers
+    ]

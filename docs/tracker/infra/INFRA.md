@@ -19,12 +19,13 @@ Legend: `[x]` done | `[~]` stub/partial | `[ ]` not started
 - [x] Cache key design: `cache:ltp:*`, `cache:chain:*`, `cache:greeks:*`
 
 ## TimescaleDB
-- [x] `infra/docker/timescaledb/init.sql` — hypertables for `ticks`, `greeks`, `order_events`, `portfolio_snapshots`
-- [x] Continuous aggregate `ohlcv_1m` (1-minute OHLCV from ticks)
+- [x] `infra/docker/timescaledb/init.sql` — hypertables for `ticks`, `greeks`, `order_events`, `portfolio_snapshots`, `trade_logs`
+- [~] Continuous aggregate `ohlcv_1m` (1-minute OHLCV from ticks) — **BROKEN**: column mismatch (`bucket` vs `ts` in query), no refresh policy, historical endpoint crashes (missing `db_url` arg in `historical.py` line 24)
 - [ ] Continuous aggregate `ohlcv_5m` (5-minute, cascading from 1m)
 - [ ] Compression policy on `ticks` (older than 1 day)
 - [ ] Retention policy on `ticks` (30-day drop)
 - [~] Alembic migrations — directory exists, **no migration files created yet**
+- [ ] **Ticks never written to TimescaleDB** — `ticks` hypertable is empty. `publisher.py` in market_data_service only publishes to Redis, never INSERTs to DB. Need `TickPersister` with batched async writes (buffer ~500, flush every 1-2s). Blocks all historical data, OHLCV aggregation, and charting.
 
 ## Docker
 - [x] Dockerfile for `market_data_service` (multi-stage: base/dev/prod)
@@ -39,6 +40,6 @@ Legend: `[x]` done | `[~]` stub/partial | `[ ]` not started
 ## Summary
 | Status | Count |
 |--------|-------|
-| Done | 12 |
+| Done | 13 |
 | Partial/Stub | 2 |
-| Not Started | 5 |
+| Not Started | 6 |

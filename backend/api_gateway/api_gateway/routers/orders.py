@@ -4,28 +4,91 @@ from __future__ import annotations
 
 import asyncio
 import json as _json
+import os
 import re
 from typing import Any
 
 import httpx
 import structlog
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.alias_generators import to_camel
+
+from shared.instruments import exchange_from_segment, get_instrument_master
+from shared.live_session import get_active_ucc
 
 from api_gateway.config import settings
 
 router = APIRouter(prefix="/api/v1", tags=["orders"])
 log = structlog.get_logger()
 
+# SDK v3 validates order parameters client-side and rejects anything outside
+# these sets — generic aliases ("NSE", "Limit", "CO", "GTC") that v2 silently
+# resolved now come back as an opaque {"Error": ApiValueError(...)} dict. We
+# mirror the allow-lists here so a bad value fails as a 422 at the boundary,
+# naming the offending field, instead of surfacing as a failed order.
+_VALID_SEGMENTS = frozenset({"nse_cm", "bse_cm", "nse_fo", "bse_fo", "mcx_fo"})
+_VALID_ORDER_TYPES = frozenset({"L", "MKT", "SL", "SL-M"})
+_VALID_PRODUCTS = frozenset({"CNC", "NRML", "MIS", "MTF"})
+# mcx_fo is DAY-only; enforced per-segment in _validate_validity().
+_VALID_VALIDITIES = frozenset({"DAY", "IOC"})
+# Order types that carry a real limit price. v3 rejects price<=0 for these
+# because the exchange would otherwise substitute a default and fill at a
+# nonsense price.
+_LIMIT_ORDER_TYPES = frozenset({"L", "SL"})
+
+
+def _validate_order_type(v: str) -> str:
+    if v not in _VALID_ORDER_TYPES:
+        raise ValueError(f"order_type must be one of {sorted(_VALID_ORDER_TYPES)}, got {v!r}")
+    return v
+
+
+def _validate_product(v: str) -> str:
+    if v not in _VALID_PRODUCTS:
+        raise ValueError(f"product must be one of {sorted(_VALID_PRODUCTS)}, got {v!r}")
+    return v
+
+
+def _validate_segment(v: str | None) -> str | None:
+    if v is not None and v not in _VALID_SEGMENTS:
+        raise ValueError(f"exchange_segment must be one of {sorted(_VALID_SEGMENTS)}, got {v!r}")
+    return v
+
+
+def _validate_validity(v: str) -> str:
+    if v not in _VALID_VALIDITIES:
+        raise ValueError(f"validity must be one of {sorted(_VALID_VALIDITIES)}, got {v!r}")
+    return v
+
 
 class ModifyOrderRequest(BaseModel):
-    quantity: int = Field(..., ge=1)
+    # Send either quantity (units) or lots; with lots the backend converts
+    # using its own lot size. Both → must agree.
+    quantity: int | None = Field(default=None, ge=1)
+    lots: int | None = Field(default=None, ge=1)
     price: float = Field(default=0, ge=0)
     trigger_price: float = Field(default=0, ge=0)
     disclosed_quantity: int = Field(default=0, ge=0)
     validity: str = "DAY"
     order_type: str
+    trading_symbol: str
+    transaction_type: str  # "B" or "S"
+    # Retained for the caller's benefit (and for lot-size lookup); SDK v3's
+    # modify_order() no longer accepts either of these.
+    exchange_segment: str | None = None
+    product: str = "NRML"
+    instrument_token: str = ""
+
+    _ck_order_type = field_validator("order_type")(_validate_order_type)
+    _ck_validity = field_validator("validity")(_validate_validity)
+    _ck_segment = field_validator("exchange_segment")(_validate_segment)
+
+    @model_validator(mode="after")
+    def _check_limit_price(self) -> ModifyOrderRequest:
+        if self.order_type in _LIMIT_ORDER_TYPES and self.price <= 0:
+            raise ValueError(f"price must be > 0 for a {self.order_type} order")
+        return self
 
 
 class PlaceOrderLeg(BaseModel):
@@ -35,13 +98,25 @@ class PlaceOrderLeg(BaseModel):
     strike: float | None = None
     option_type: str | None = None  # "CE" or "PE"
     transaction_type: str  # "B" or "S"
-    quantity: int = Field(..., ge=1)
+    # Send either quantity (units) or lots; with lots the backend converts
+    # using its own lot size. Both → must agree.
+    quantity: int | None = Field(default=None, ge=1)
+    lots: int | None = Field(default=None, ge=1)
     order_type: str = "MKT"  # "L", "MKT", "SL", "SL-M"
     product: str = "NRML"
     price: float = 0
     trigger_price: float = 0
     disclosed_quantity: int = 0
     tag: str | None = None
+
+    _ck_order_type = field_validator("order_type")(_validate_order_type)
+    _ck_product = field_validator("product")(_validate_product)
+
+    @model_validator(mode="after")
+    def _check_limit_price(self) -> PlaceOrderLeg:
+        if self.order_type in _LIMIT_ORDER_TYPES and self.price <= 0:
+            raise ValueError(f"price must be > 0 for a {self.order_type} order")
+        return self
 
 
 class PlaceOrdersRequest(BaseModel):
@@ -96,6 +171,28 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
+def _validate_commodity_leg(quantity: int, cfg: Any) -> str | None:
+    """Reject MCX legs whose quantity isn't a whole number of lots."""
+    if cfg.lot_size > 0 and quantity % cfg.lot_size != 0:
+        return f"Quantity {quantity} is not a multiple of the {cfg.lot_size} lot size"
+    return None
+
+
+def _segment_for_trading_symbol(trading_symbol: str) -> str:
+    """Exchange segment for a Kotak trading symbol via its underlying prefix."""
+    m = re.match(r"^([A-Z]+)", trading_symbol or "")
+    cfg = get_instrument_master().get(m.group(1)) if m else None
+    return cfg.segment if cfg else "nse_fo"
+
+
+def _mcx_live_orders_enabled() -> bool:
+    """Opt-in switch for live MCX placement (margin preview and paper trading
+    are unaffected). The mcx_fo quantity unit was verified as units (lots ×
+    lLotSize) via check-margin on 2026-09-25; the gate stays until the live
+    feed price scale is also confirmed."""
+    return os.environ.get("MCX_LIVE_ORDERS_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _split_by_freeze(qty: int, freeze_qty: int, lot_size: int) -> list[int]:
     """Split quantity into chunks respecting freeze limit and lot size."""
     if freeze_qty <= 0 or qty <= freeze_qty:
@@ -114,20 +211,26 @@ def _split_by_freeze(qty: int, freeze_qty: int, lot_size: int) -> list[int]:
 
 
 async def _get_neo_client():
-    """Initialize a NeoAPI client from cached Kotak credentials."""
+    """Initialize a NeoAPI client from the versioned session."""
     from neo_api_client import NeoAPI
-    from shared.redis_client import cache_get
+    from shared.live_session import get_live_kotak_credentials
+    from shared.schemas.auth import SessionState
+    from shared.session_client import get_session
 
-    creds_raw = await cache_get(settings.redis_url, "cache:auth:kotak")
-    if not creds_raw:
+    session = await get_session(settings.redis_url)
+    live_creds = get_live_kotak_credentials()
+    if (
+        not session
+        or session.state not in (SessionState.ACTIVE, SessionState.DEGRADED)
+        or live_creds is None
+    ):
         raise HTTPException(status_code=401, detail="Kotak session unavailable")
 
-    creds = _json.loads(creds_raw)
-    access_token = creds.get("access_token", "")
-    sid = creds.get("extra", {}).get("sid", "")
-    base_url = creds.get("extra", {}).get("base_url", "")
-
-    if not access_token or not base_url:
+    access_token = live_creds.access_token.get_secret_value()
+    extra = live_creds.extra
+    sid = str(extra.get("sid") or "")
+    base_url = str(extra.get("base_url") or session.base_url or "")
+    if not access_token or not sid or not base_url:
         raise HTTPException(status_code=401, detail="Kotak session unavailable")
 
     if not base_url.startswith("http"):
@@ -135,26 +238,48 @@ async def _get_neo_client():
     base_url = base_url.rstrip("/")
 
     environment = settings.kotak_environment or "prod"
-    client = NeoAPI(
-        consumer_key=settings.kotak_consumer_key,
-        environment=environment,
-        access_token=access_token,
-    )
-    # Inject authenticated session state — SDK guards on edit_token + edit_sid
-    client.configuration.bearer_token = access_token
-    client.configuration.edit_token = access_token
-    client.configuration.edit_sid = sid
-    client.configuration.edit_rid = creds.get("extra", {}).get("rid", "")
-    client.configuration.serverId = creds.get("extra", {}).get("hsServerId", sid)
-    client.configuration.sid = sid
-    client.configuration.base_url = base_url
+    # The key belongs to the account that logged in; fall back to the env var
+    # for legacy single-account deployments.
+    consumer_key = str(extra.get("consumer_key") or "") or settings.kotak_consumer_key
 
-    return client
+    def _build() -> NeoAPI:
+        # NeoAPI() does synchronous network I/O in its constructor (requests,
+        # no timeout). Running it on the event loop froze the entire gateway
+        # (0% CPU, /health dead) whenever Kotak stalled — keep it in a thread
+        # and bound it.
+        client = NeoAPI(
+            consumer_key=consumer_key,
+            environment=environment,
+            access_token=access_token,
+        )
+        # Inject authenticated session state — SDK guards on edit_token + edit_sid.
+        # We authenticate out-of-band (shared.auth.kotak), so the SDK's own
+        # totp_validate() never runs and never populates these itself.
+        client.configuration.bearer_token = access_token
+        client.configuration.edit_token = access_token
+        client.configuration.edit_sid = sid
+        client.configuration.edit_rid = ""
+        client.configuration.sid = sid
+        client.configuration.base_url = base_url
+        # ucc/data_center are unused by the REST path but are what
+        # create_websocket()/create_order_feed() read if we ever route the
+        # feeds through this client.
+        client.configuration.ucc = str(extra.get("ucc") or "")
+        client.configuration.data_center = str(extra.get("data_center") or "") or None
+        # NOTE: v2's `configuration.serverId` (sent as the `sId` query param) is
+        # gone in v3 — no service reads it, and assigning it would be a silent
+        # no-op rather than an error.
+        return client
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_build), timeout=15.0)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Kotak SDK init timed out")
 
 
 async def _resolve_order_legs(orders: list[PlaceOrderLeg]) -> tuple[list[dict[str, Any]], list[PlaceOrderResult]]:
     from shared.redis_client import get_redis
-    from shared.instruments import get_instrument_master
+    from shared.instruments import get_instrument_master, order_quantity_from_lots
 
     im = get_instrument_master()
     resolved_legs: list[dict[str, Any]] = []
@@ -203,7 +328,41 @@ async def _resolve_order_legs(orders: list[PlaceOrderLeg]) -> tuple[list[dict[st
         if cfg:
             exchange_segment = cfg.segment
         if not exchange_segment:
-            exchange_segment = "nse_fo"
+            # Untracked underlying (e.g. NSE stock option square-off). All
+            # configured underlyings, MCX included, resolve above.
+            log.warning("orders.segment_fallback", underlying=underlying,
+                           trading_symbol=trading_symbol)
+            exchange_segment = _segment_for_trading_symbol(trading_symbol or "")
+
+        # The segment comes from instruments.json, not the client, so a bad
+        # value here is a config error. SDK v3 rejects anything outside the
+        # canonical set — catch it with a named leg error rather than letting
+        # the whole batch fail on an opaque SDK dict.
+        if exchange_segment not in _VALID_SEGMENTS:
+            errors.append(PlaceOrderResult(
+                index=i,
+                success=False,
+                trading_symbol=trading_symbol,
+                error=(
+                    f"Unsupported exchange segment {exchange_segment!r} for {underlying}; "
+                    f"expected one of {sorted(_VALID_SEGMENTS)}"
+                ),
+            ))
+            continue
+
+        quantity, qty_error = await order_quantity_from_lots(
+            settings.redis_url, underlying, leg.expiry, leg.quantity, leg.lots,
+        )
+        if qty_error or quantity is None:
+            errors.append(PlaceOrderResult(index=i, success=False, trading_symbol=trading_symbol,
+                                           error=qty_error or "Invalid quantity"))
+            continue
+
+        if cfg is not None and cfg.asset_class == "commodity":
+            mcx_error = _validate_commodity_leg(quantity, cfg)
+            if mcx_error:
+                errors.append(PlaceOrderResult(index=i, success=False, error=mcx_error))
+                continue
 
         resolved_legs.append({
             "original_index": i,
@@ -211,7 +370,7 @@ async def _resolve_order_legs(orders: list[PlaceOrderLeg]) -> tuple[list[dict[st
             "scrip_token": scrip_token,
             "exchange_segment": exchange_segment,
             "transaction_type": leg.transaction_type,
-            "quantity": leg.quantity,
+            "quantity": quantity,
             "order_type": leg.order_type,
             "product": leg.product,
             "price": leg.price,
@@ -231,20 +390,23 @@ def _parse_json_response(resp: httpx.Response) -> Any:
 
 
 async def _load_kotak_session() -> tuple[str, dict[str, str]]:
-    import json as _json
+    from shared.live_session import get_live_kotak_credentials
+    from shared.schemas.auth import SessionState
+    from shared.session_client import get_session
 
-    from shared.redis_client import cache_get
-
-    creds_raw = await cache_get(settings.redis_url, "cache:auth:kotak")
-    if not creds_raw:
+    session = await get_session(settings.redis_url)
+    live_creds = get_live_kotak_credentials()
+    if (
+        not session
+        or session.state not in (SessionState.ACTIVE, SessionState.DEGRADED)
+        or live_creds is None
+    ):
         raise HTTPException(status_code=401, detail="Kotak session unavailable")
 
-    creds = _json.loads(creds_raw)
-    base_url = creds.get("extra", {}).get("base_url", "")
-    access_token = creds.get("access_token", "")
-    sid = creds.get("extra", {}).get("sid", "")
-
-    if not base_url or not access_token:
+    access_token = live_creds.access_token.get_secret_value()
+    sid = str(live_creds.extra.get("sid") or "")
+    base_url = str(live_creds.extra.get("base_url") or session.base_url or "")
+    if not access_token or not sid or not base_url:
         raise HTTPException(status_code=401, detail="Kotak session unavailable")
     if not base_url.startswith("http"):
         base_url = f"https://{base_url}"
@@ -373,6 +535,14 @@ async def place_orders(body: PlaceOrdersRequest, request: Request):
     expanded_legs: list[dict[str, Any]] = []
 
     for rl in resolved_legs:
+        if rl["exchange_segment"] == "mcx_fo" and not _mcx_live_orders_enabled():
+            results.append(PlaceOrderResult(
+                index=rl["original_index"],
+                success=False,
+                error="Live MCX orders are disabled until the mcx_fo quantity unit is "
+                      "verified (set MCX_LIVE_ORDERS_ENABLED=true); use paper trading",
+            ))
+            continue
         underlying = ""
         m = re.match(r"^([A-Z]+)", rl["trading_symbol"])
         if m:
@@ -424,7 +594,9 @@ async def place_orders(body: PlaceOrdersRequest, request: Request):
             continue
 
         try:
-            result = await asyncio.to_thread(
+            # Bounded: a hung SDK call must fail the request, not hold the
+            # worker thread (and the user's order flow) forever.
+            result = await asyncio.wait_for(asyncio.to_thread(
                 neo_client.place_order,
                 exchange_segment=rl["exchange_segment"],
                 product=rl["product"],
@@ -437,10 +609,8 @@ async def place_orders(body: PlaceOrdersRequest, request: Request):
                 trigger_price=str(rl["trigger_price"]),
                 amo="NO",
                 disclosed_quantity=str(rl["disclosed_quantity"]),
-                market_protection="0",
-                pf="N",
                 tag=rl["tag"] or None,
-            )
+            ), timeout=30.0)
             log.info("orders.place_order_result", index=idx, result=result)
 
             # Parse SDK response
@@ -481,7 +651,37 @@ async def place_orders(body: PlaceOrdersRequest, request: Request):
 
     # Sort results by original index
     results.sort(key=lambda r: r.index)
+
+    # Persist trade fills asynchronously — fetch trade report and write to trade_logs
+    if any(r.success for r in results):
+        base_url, headers = await _load_kotak_session()
+        asyncio.create_task(
+            _persist_trade_fills_background(
+                base_url=base_url,
+                access_token=headers["Auth"],
+                sid=headers["Sid"],
+                ucc=get_active_ucc(),
+            )
+        )
+
     return results
+
+
+async def _persist_trade_fills_background(
+    *, base_url: str, access_token: str, sid: str, ucc: str
+) -> None:
+    """Fetch today's trade report from Kotak and persist fills to trade_logs."""
+    from shared.positions import fetch_trade_report
+    from shared.trade_logger import persist_trade_fills
+
+    try:
+        # Small delay to let the order fill settle at the broker
+        await asyncio.sleep(2)
+        raw = await fetch_trade_report(base_url, access_token, sid)
+        if raw:
+            await persist_trade_fills(settings.timescaledb_url, raw, ucc)
+    except Exception:
+        log.exception("orders.persist_fills_background_error")
 
 
 @router.post("/margin-preview", response_model=MarginPreviewResponse)
@@ -595,6 +795,42 @@ async def margin_preview(body: PlaceOrdersRequest, request: Request):
     )
 
 
+@router.get("/limits")
+async def get_limits(request: Request):
+    """Fetch account margin limits from Kotak Neo."""
+    base_url, headers = await _load_kotak_session()
+    client = _client(request)
+    try:
+        jdata = _json.dumps({"seg": "ALL", "exch": "ALL", "prod": "ALL"})
+        resp = await client.post(
+            f"{base_url}/quick/user/limits",
+            headers=headers,
+            content=f"jData={jdata}",
+            timeout=10.0,
+        )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=resp.status_code, detail="Limits fetch failed")
+        data = resp.json()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.error("limits.fetch_failed", error=str(exc))
+        raise HTTPException(status_code=502, detail="Limits fetch failed")
+
+    margin_used = (
+        (_safe_float(data.get("UnrealizedMtomPrsnt")) or 0)
+        + (_safe_float(data.get("ExposureMarginPrsnt")) or 0)
+        + (_safe_float(data.get("FoSpanrgnNrmlPrsnt")) or 0)
+    )
+
+    return {
+        "net": _safe_float(data.get("Net")),
+        "marginUsed": margin_used,
+        "collateral": _safe_float(data.get("CollateralValue")),
+        "marginFromShares": _safe_float(data.get("Collateral")),
+    }
+
+
 @router.get("/order-book")
 async def get_order_book(request: Request):
     """Fetch full order book from Kotak, split into open and closed."""
@@ -616,16 +852,14 @@ async def get_order_book(request: Request):
 
     for o in data["data"]:
         ex_seg = str(o.get("exSeg", "") or o.get("exchange", ""))
-        exchange = (
-            "NSE" if "nse" in ex_seg.lower()
-            else "BSE" if "bse" in ex_seg.lower()
-            else ex_seg.upper()
-        )
+        exchange = exchange_from_segment(ex_seg)
         row = {
             "orderId": o.get("nOrdNo", ""),
             "tradingSymbol": o.get("trdSym", ""),
             "symbol": o.get("sym", ""),
             "exchange": exchange,
+            "exchangeSegment": ex_seg,
+            "instrumentToken": o.get("tok", ""),
             "side": "BUY" if o.get("trnsTp") == "B" else "SELL",
             "quantity": int(o.get("qty", "0") or "0"),
             "filledQty": int(o.get("fldQty", "0") or "0"),
@@ -658,16 +892,16 @@ async def get_order_book(request: Request):
 
 @router.post("/orders/{order_id}/cancel")
 async def cancel_order(order_id: str, request: Request):
-    payload = await _kotak_request(
-        request,
-        "POST",
-        "/quick/order/cancel",
-        json={
-            "order_id": order_id,
-            "amo": "NO",
-        },
+    neo_client = await _get_neo_client()
+    result = await asyncio.wait_for(
+        asyncio.get_event_loop().run_in_executor(
+            None, lambda: neo_client.cancel_order(order_id=order_id)
+        ),
+        timeout=30.0,
     )
-    return {"ok": True, "result": payload}
+    if isinstance(result, dict) and result.get("Error"):
+        raise HTTPException(status_code=400, detail=result)
+    return {"ok": True, "result": result}
 
 
 @router.post("/orders/{order_id}/modify")
@@ -676,21 +910,38 @@ async def modify_order(
     body: ModifyOrderRequest,
     request: Request,
 ):
-    payload = await _kotak_request(
-        request,
-        "POST",
-        "/quick/order/vr/modify",
-        json={
-            "order_id": order_id,
-            "price": str(body.price),
-            "quantity": str(body.quantity),
-            "disclosed_quantity": str(body.disclosed_quantity),
-            "trigger_price": str(body.trigger_price),
-            "validity": body.validity,
-            "order_type": body.order_type,
-        },
+    from shared.instruments import order_quantity_from_lots
+
+    m = re.match(r"^([A-Z]+)", body.trading_symbol or "")
+    quantity, qty_error = await order_quantity_from_lots(
+        settings.redis_url, m.group(1) if m else None, None, body.quantity, body.lots,
     )
-    return {"ok": True, "result": payload}
+    if qty_error or quantity is None:
+        raise HTTPException(status_code=400, detail=qty_error or "Invalid quantity")
+
+    neo_client = await _get_neo_client()
+    result = await asyncio.wait_for(
+        asyncio.get_event_loop().run_in_executor(
+        None,
+        # SDK v3 dropped instrument_token/exchange_segment/product/
+        # trading_symbol/transaction_type — the backend never required them for
+        # a modify, and passing them now raises TypeError. The order number
+        # alone identifies the order; the exchange keeps the rest.
+        lambda: neo_client.modify_order(
+            order_id=order_id,
+            price=str(body.price),
+            order_type=body.order_type,
+            quantity=str(quantity),
+            validity=body.validity,
+            trigger_price=str(body.trigger_price),
+            disclosed_quantity=str(body.disclosed_quantity),
+        ),
+        ),
+        timeout=30.0,
+    )
+    if isinstance(result, dict) and result.get("Error"):
+        raise HTTPException(status_code=400, detail=result)
+    return {"ok": True, "result": result}
 
 
 @router.get("/positions")
@@ -698,26 +949,21 @@ async def get_positions(request: Request):
     """Fetch positions from Kotak API, enrich with trade fills and cached LTP."""
     import json as _json
     from shared.positions import (
+        enrich_positions_with_trade_history,
         enrich_positions_with_trades,
         fetch_kotak_positions,
         fetch_trade_report,
     )
     from shared.redis_client import cache_get
 
-    creds_raw = await cache_get(settings.redis_url, "cache:auth:kotak")
-    if not creds_raw:
+    try:
+        base_url, headers = await _load_kotak_session()
+    except HTTPException:
         return []
 
-    creds = _json.loads(creds_raw)
-    base_url = creds.get("extra", {}).get("base_url", "")
-    access_token = creds.get("access_token", "")
-    sid = creds.get("extra", {}).get("sid", "")
-
-    if not base_url or not access_token:
-        return []
-    if not base_url.startswith("http"):
-        base_url = f"https://{base_url}"
-    base_url = base_url.rstrip("/")
+    access_token = headers["Auth"]
+    sid = headers["Sid"]
+    ucc = get_active_ucc()
 
     result = await fetch_kotak_positions(base_url, access_token, sid)
     if not result:
@@ -725,11 +971,54 @@ async def get_positions(request: Request):
 
     # Fetch trade report and use actual fill prices for realized P&L
     trades = await fetch_trade_report(base_url, access_token, sid)
-    if trades:
-        corrected_realized = enrich_positions_with_trades(
-            result["positions"], trades
+    if trades is not None:
+        if trades:
+            corrected_realized = enrich_positions_with_trades(
+                result["positions"], trades
+            )
+            result["realizedPnl"] = corrected_realized
+
+            # Persist fills to trade_logs for FIFO P&L history
+            from shared.trade_logger import persist_trade_fills
+            await persist_trade_fills(settings.timescaledb_url, trades, ucc)
+
+        corrected_realized = await enrich_positions_with_trade_history(
+            settings.timescaledb_url,
+            result["positions"],
+            ucc,
         )
-        result["realizedPnl"] = corrected_realized
+        if corrected_realized is not None:
+            result["realizedPnl"] = corrected_realized
+
+    # Seed synthetic fills for CF positions where trade_logs has incomplete history
+    # (e.g. system wasn't running when the position was opened)
+    from shared.trade_logger import compute_fifo_pnl, seed_missing_fills
+    await seed_missing_fills(settings.timescaledb_url, result["positions"], ucc)
+
+    # Override avgPrice with FIFO entry price from trade_logs
+    for pos in result.get("positions", []):
+        if not pos.get("isOpen", True):
+            continue
+        fifo = await compute_fifo_pnl(settings.timescaledb_url, pos["symbol"], ucc=ucc)
+        if fifo["total_fills"] > 0 and fifo["avg_entry_price"] > 0:
+            pos["avgPrice"] = fifo["avg_entry_price"]
+
+    # Save positions to DB (bootup snapshot) — awaited so DB is populated
+    # before the WS reconciliation fires
+    from shared.positions import save_positions
+    await save_positions(settings.timescaledb_url, result["positions"])
+
+    # Notify PositionSubscriber to subscribe tokens for live LTP
+    import orjson
+    from shared.redis_client import get_redis
+    open_symbols = [
+        {"symbol": p["symbol"], "tradingSymbol": p.get("tradingSymbol", "")}
+        for p in result["positions"]
+        if p.get("isOpen", True) and p.get("netQty", 0) != 0
+    ]
+    if open_symbols:
+        async with get_redis(settings.redis_url) as client:
+            await client.publish("subscribe:positions", orjson.dumps(open_symbols))
 
     # Inline LTP enrichment for the initial REST response so the UI isn't
     # all zeros before the option chain WebSocket delivers live ticks.
@@ -738,6 +1027,9 @@ async def get_positions(request: Request):
         if not sym:
             continue
         ltp_raw = await cache_get(settings.redis_url, f"cache:ltp:{sym}")
+        # LKGV fallback: if live LTP cache expired, use last known good value
+        if not ltp_raw:
+            ltp_raw = await cache_get(settings.redis_url, f"cache:lkgv:{sym}")
         if not ltp_raw:
             continue
         try:
@@ -749,34 +1041,35 @@ async def get_positions(request: Request):
             pos["ltp"] = ltp
             net_qty = pos.get("netQty", 0)
             adj = pos.get("multiplier", 1)
-            unrealized = net_qty * ltp * adj
-            pos["unrealizedPnl"] = round(unrealized, 2)
-            pos["pnl"] = round(pos.get("bookedPnl", 0) + unrealized, 2)
+            total_pnl = pos.get("bookedPnl", 0) + (net_qty * ltp * adj)
+            realized_component = pos.get("realizedPnlComponent", 0)
+            pos["unrealizedPnl"] = round(total_pnl - realized_component, 2) if net_qty != 0 else 0.0
+            pos["pnl"] = round(total_pnl, 2)
 
     return result
+
+
+@router.get("/positions/raw")
+async def get_positions_raw(request: Request):
+    """Temporary local debug route for raw Kotak positions payload."""
+    try:
+        return await _kotak_request(request, "GET", "/quick/user/positions")
+    except HTTPException:
+        return []
 
 
 @router.get("/trade-report")
 async def get_trade_report(request: Request):
     """Fetch today's trade fills from Kotak, grouped by symbol with P&L."""
-    import json as _json
     from shared.positions import compute_realized_from_trades, fetch_trade_report
-    from shared.redis_client import cache_get
 
-    creds_raw = await cache_get(settings.redis_url, "cache:auth:kotak")
-    if not creds_raw:
+    try:
+        base_url, headers = await _load_kotak_session()
+    except HTTPException:
         return {"trades": [], "realizedPnl": 0}
 
-    creds = _json.loads(creds_raw)
-    base_url = creds.get("extra", {}).get("base_url", "")
-    access_token = creds.get("access_token", "")
-    sid = creds.get("extra", {}).get("sid", "")
-
-    if not base_url or not access_token:
-        return {"trades": [], "realizedPnl": 0}
-    if not base_url.startswith("http"):
-        base_url = f"https://{base_url}"
-    base_url = base_url.rstrip("/")
+    access_token = headers["Auth"]
+    sid = headers["Sid"]
 
     raw = await fetch_trade_report(base_url, access_token, sid)
     if not raw:

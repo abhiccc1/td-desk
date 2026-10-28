@@ -18,6 +18,9 @@ class GreeksResult(BaseModel):
     gamma: float
     theta: float
     vega: float
+    vanna: float = 0.0
+    charm: float = 0.0
+    vomma: float = 0.0
     underlying_price: float
     timestamp: datetime
 
@@ -60,6 +63,8 @@ class ModelStrikeResult(BaseModel):
     heston_put_price: float | None = None
     vg_call_price: float | None = None
     vg_put_price: float | None = None
+    heston_pop: float | None = None  # P(profit) for buying call at this strike
+    vg_pop: float | None = None
 
 
 class ModelPricesResult(BaseModel):
@@ -70,7 +75,13 @@ class ModelPricesResult(BaseModel):
     spot: float
     heston_params: dict[str, float]
     vg_params: dict[str, float]
+    heston_calibrated: bool = False
+    vg_calibrated: bool = False
+    heston_rmse: float | None = None
+    vg_rmse: float | None = None
     strikes: list[ModelStrikeResult]
+    heston_density: list[list[float]] | None = None  # [[strike, density], ...] for frontend chart
+    vg_density: list[list[float]] | None = None
     timestamp: datetime
 
 
@@ -82,6 +93,18 @@ class VarianceGammaParams(BaseModel):
     sigma: float      # volatility of Brownian component
     theta: float      # drift of Brownian component (skew)
     nu: float         # variance rate of Gamma subordinator (kurtosis)
+    timestamp: datetime
+
+
+class VrpResult(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, alias_generator=to_camel)
+
+    underlying: str
+    atm_iv: float
+    realized_vol: float
+    vrp: float
+    iv_rank: float | None  # 0-100 percentile
+    window_days: int  # e.g. 10
     timestamp: datetime
 
 
