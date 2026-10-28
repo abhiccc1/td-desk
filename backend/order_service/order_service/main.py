@@ -20,8 +20,13 @@ log = structlog.get_logger()
 
 async def _command_listener() -> None:
     """Listen on ``orders:commands`` for incoming command messages."""
-    async for message in subscribe("orders:commands"):
-        log.info("order_service.command_received", message=message)
+    async for channel, event in subscribe(settings.redis_url, ["orders:commands"]):
+        log.info(
+            "order_service.command_received",
+            channel=channel,
+            event_type=event.event_type,
+            source_service=event.source_service,
+        )
         # TODO: dispatch command (cancel basket, amend order, etc.)
 
 

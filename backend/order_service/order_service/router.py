@@ -76,7 +76,6 @@ async def submit_basket(basket_id: str, user_id: str = "anonymous"):
         await publish_order_update(user_id, fill)
 
     await publish_basket_status(user_id, basket_id, basket.state)
-    await _tracker.persist()
 
     return {
         "basket_id": basket_id,

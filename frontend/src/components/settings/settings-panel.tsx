@@ -79,8 +79,17 @@ export function SettingsPanel({ onClose }: Props) {
         <section className="mb-8">
           <h2 className="mb-1 text-sm font-semibold text-card-foreground">Kotak Neo</h2>
           <p className="mb-4 text-xs text-muted-foreground">
-            Broker credentials used during TOTP login.
+            Fallback identity for TOTP login. Ignored when the backend has account
+            profiles configured — those supply the mobile number and UCC, and the
+            login screen shows a picker instead.
           </p>
+
+          <div className="mb-4 rounded-sm border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+            To trade multiple accounts, set <code>KOTAK_ACCOUNTS</code> in the backend
+            <code> .env</code> — a JSON array of{" "}
+            <code>{`{id, label, consumer_key, mobile, ucc}`}</code>. Consumer keys stay
+            on the server and are never sent to this app.
+          </div>
 
           <label className="mb-3 flex flex-col gap-1">
             <span className="text-xs text-muted-foreground">Mobile Number</span>

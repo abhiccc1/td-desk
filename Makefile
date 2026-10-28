@@ -3,13 +3,16 @@
 # ─────────────────────────────────────────────────────────────────────
 #
 # Usage:
-#   make start                  # Start all backend services
+#   make start                  # Fast start (no rebuild); keep session_broker if already running
+#   make start full             # Rebuild images + start all backend services
 #   make start infra            # Redis + TimescaleDB only
 #   make stop                   # Stop all backend services
 #   make restart                # Stop + start
 #   make build                  # Build all (Rust + Docker images)
 #   make build rust             # Build td_core Rust extension only
 #   make build docker           # Build Docker images only
+#   make bake                   # Build Docker images via buildx bake
+#   make bake-print             # Print the compose-derived bake plan
 #   make logs                   # Tail all docker logs
 #   make logs <service>         # Tail logs for one service
 #   make status                 # Show running services
@@ -26,6 +29,12 @@ SHELL := /bin/bash
 ROOT       := $(shell pwd)
 BACKEND    := $(ROOT)/backend
 RUST_CORE  := $(BACKEND)/quant_service/rust_core
+COMPOSE_FILE ?= docker-compose.yml
+COMPOSE_BAKE ?= true
+DOCKER_COMPOSE := COMPOSE_BAKE=$(COMPOSE_BAKE) docker compose
+DOCKER_BAKE := docker buildx bake -f $(COMPOSE_FILE)
+CORE_SERVICES := redis timescaledb market_data_service quant_service order_service api_gateway
+ALL_SERVICES := $(CORE_SERVICES) session_broker
 
 # Log helper
 define log
@@ -45,14 +54,17 @@ help:
 	$(call log,"")
 	$(call log,"  $(C)td-desk$(R) — Backend Services")
 	$(call log,"")
-	$(call log,"  $(G)make start$(R)                 Start all backend services")
+	$(call log,"  $(G)make start$(R)                 Fast start (no rebuild); keep session_broker if already running")
+	$(call log,"  $(G)make start full$(R)            Rebuild images + start all backend services")
 	$(call log,"  $(G)make start infra$(R)           Redis + TimescaleDB only")
 	$(call log,"  $(G)make stop$(R)                  Stop all backend services")
 	$(call log,"  $(G)make restart$(R)               Stop + start")
 	$(call log,"")
 	$(call log,"  $(G)make build$(R)                 Build all (Rust + Docker images)")
 	$(call log,"  $(G)make build rust$(R)            Build td_core Rust/PyO3 extension")
-	$(call log,"  $(G)make build docker$(R)          Build Docker images")
+	$(call log,"  $(G)make build docker$(R)          Build Docker images (Compose Bake enabled)")
+	$(call log,"  $(G)make bake$(R)                  Build Docker images via buildx bake")
+	$(call log,"  $(G)make bake-print$(R)            Print the compose-derived bake plan")
 	$(call log,"")
 	$(call log,"  $(G)make logs$(R)                  Tail all Docker logs")
 	$(call log,"  $(G)make logs <service>$(R)        Tail logs for one service")
@@ -73,17 +85,28 @@ help:
 ifeq ($(word 2,$(MAKECMDGOALS)),)
 start:
 	$(call log,"$(C)Starting backend services...$(R)")
-	@docker compose up -d --build
+	@if $(DOCKER_COMPOSE) ps --services --filter status=running session_broker 2>/dev/null | grep -qx "session_broker"; then \
+		echo -e "$(Y)session_broker already running — leaving it untouched$(R)"; \
+		$(DOCKER_COMPOSE) up -d $(CORE_SERVICES); \
+	else \
+		$(DOCKER_COMPOSE) up -d $(ALL_SERVICES); \
+	fi
 	$(call log,"$(G)✓ Backend running — API at http://localhost:8000$(R)")
 else
 start: start-$(word 2,$(MAKECMDGOALS))
 	@:
 endif
 
+.PHONY: start-full
+start-full:
+	$(call log,"$(C)Starting all backend services (full, rebuild)...$(R)")
+	@$(DOCKER_COMPOSE) up -d --build $(ALL_SERVICES)
+	$(call log,"$(G)✓ Full backend start complete — API at http://localhost:8000$(R)")
+
 .PHONY: start-infra
 start-infra:
 	$(call log,"$(C)Starting infrastructure (Redis + TimescaleDB)...$(R)")
-	@docker compose up -d redis timescaledb
+	@$(DOCKER_COMPOSE) up -d redis timescaledb
 	$(call log,"$(G)✓ Infrastructure ready$(R)")
 
 # ─── Stop ─────────────────────────────────────────────────────────────
@@ -91,7 +114,7 @@ start-infra:
 .PHONY: stop
 stop:
 	$(call log,"$(C)Stopping backend services...$(R)")
-	@docker compose down
+	@$(DOCKER_COMPOSE) down
 	$(call log,"$(G)✓ Backend stopped$(R)")
 
 # ─── Restart ──────────────────────────────────────────────────────────
@@ -113,21 +136,30 @@ endif
 .PHONY: build-rust
 build-rust:
 	$(call log,"$(C)Building td_core (Rust/PyO3) via Docker...$(R)")
-	@docker compose build quant_service
+	@$(DOCKER_COMPOSE) build quant_service
 	$(call log,"$(G)✓ td_core built inside quant_service image$(R)")
 
 .PHONY: build-docker
 build-docker:
-	$(call log,"$(C)Building Docker images...$(R)")
-	@docker compose build
+	$(call log,"$(C)Building Docker images with Compose Bake...$(R)")
+	@$(DOCKER_COMPOSE) build
 	$(call log,"$(G)✓ Docker images built$(R)")
+
+.PHONY: bake bake-print
+bake:
+	$(call log,"$(C)Building Docker images via buildx bake...$(R)")
+	@$(DOCKER_BAKE) --load
+	$(call log,"$(G)✓ Bake build complete$(R)")
+
+bake-print:
+	@$(DOCKER_BAKE) --print
 
 # ─── Logs ─────────────────────────────────────────────────────────────
 
 .PHONY: logs
 ifeq ($(word 2,$(MAKECMDGOALS)),)
 logs:
-	@docker compose logs -f
+	@$(DOCKER_COMPOSE) logs -f
 else
 logs: _logs-target
 	@:
@@ -135,13 +167,13 @@ endif
 
 .PHONY: _logs-target
 _logs-target:
-	@docker compose logs -f $(word 2,$(MAKECMDGOALS))
+	@$(DOCKER_COMPOSE) logs -f $(word 2,$(MAKECMDGOALS))
 
 # ─── Status ───────────────────────────────────────────────────────────
 
 .PHONY: status
 status:
-	@docker compose ps 2>/dev/null || echo "  (none running)"
+	@$(DOCKER_COMPOSE) ps 2>/dev/null || echo "  (none running)"
 
 # ─── Testing ──────────────────────────────────────────────────────────
 
@@ -191,16 +223,16 @@ clean: stop
 .PHONY: clean-all
 clean-all: clean
 	$(call log,"$(Y)Removing Docker volumes (data will be lost)...$(R)")
-	@docker compose down -v 2>/dev/null || true
+	@$(DOCKER_COMPOSE) down -v 2>/dev/null || true
 	$(call log,"$(G)✓ All data removed$(R)")
 
 # ─── Shell ────────────────────────────────────────────────────────────
 
 shell-%:
-	@docker compose exec $* bash
+	@$(DOCKER_COMPOSE) exec $* bash
 
 # ─── Catch-all for sub-targets ────────────────────────────────────────
 
-.PHONY: infra rust docker
-infra rust docker:
+.PHONY: infra rust docker full
+infra rust docker full:
 	@:

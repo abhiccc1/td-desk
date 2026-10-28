@@ -8,165 +8,86 @@ import signal
 import structlog
 
 from shared.logging import setup_logging
-from shared.redis_client import get_redis
-from shared.schemas.auth import BrokerCredentials
 
 from market_data_service.config import MarketDataSettings
-from market_data_service.connectors.kotak_neo import KotakNeoConnector
 from market_data_service.publisher import TickPublisher
+from market_data_service.session_watcher import SessionWatcher
 from market_data_service.snapshot import SnapshotAggregator
 
 logger = structlog.get_logger()
 
 
-async def _run_connector(
-    connector: KotakNeoConnector,
-    publisher: TickPublisher,
-    aggregator: SnapshotAggregator,
-) -> None:
-    """Stream ticks from a single connector, feeding publisher and aggregator."""
-    logger.info("starting connector stream", connector="KOTAK")
-    async for tick in connector.stream():
-        await publisher.publish_tick(tick)
-        await aggregator.process_tick(tick)
+async def _run_scrip_master_download(settings: MarketDataSettings) -> bool:
+    """Download and cache scrip master. Returns True on success."""
+    from shared.instruments import get_instrument_master
+    from shared.live_session import get_live_kotak_credentials
+
+    from market_data_service.scrip_master import fetch_and_parse_scrip_master
+
+    creds = get_live_kotak_credentials()
+    if creds is None:
+        logger.warning("scrip_master_cron.no_session", hint="Skipping — no live Kotak session")
+        return False
+
+    im = get_instrument_master()
+
+    await fetch_and_parse_scrip_master(
+        creds, settings.redis_url,
+        consumer_key=str(creds.extra.get("consumer_key") or "") or settings.kotak_consumer_key,
+        instruments=im,
+    )
+    logger.info("scrip_master_cron.refreshed")
+    return True
 
 
-async def _watch_kotak_auth(
-    settings: MarketDataSettings,
-    publisher: TickPublisher,
-    aggregator: SnapshotAggregator,
-) -> None:
-    """Subscribe to Redis for Kotak auth events and lazily start the connector."""
-    connector: KotakNeoConnector | None = None
-    try:
-        async with get_redis(settings.redis_url) as client:
-            pubsub = client.pubsub()
-            await pubsub.subscribe("auth:kotak:authenticated")
-            async for message in pubsub.listen():
-                if message["type"] != "message":
-                    continue
+async def _daily_scrip_master_refresh(settings: MarketDataSettings) -> None:
+    """Re-download scrip master daily at 08:45 IST.
 
-                if connector is not None:
-                    logger.info("kotak_neo connector already registered, skipping")
-                    continue
+    On startup, checks if today's refresh has already run (via a Redis key).
+    If not, triggers an immediate catch-up download before entering the
+    daily schedule loop.
+    """
+    from datetime import datetime, timedelta, timezone
+    from shared.redis_client import cache_get, cache_set
 
-                import json
-                data = json.loads(message["data"])
-                creds = BrokerCredentials(**data)
+    IST = timezone(timedelta(hours=5, minutes=30))
+    TARGET_HOUR, TARGET_MINUTE = 8, 45
+    CRON_RAN_KEY = "cron:scrip_master:last_run_date"
 
-                # Download scrip master to get instrument tokens and expiry dates
-                from shared.instruments import get_instrument_master
-                from market_data_service.scrip_master import fetch_and_parse_scrip_master
+    # --- Catch-up: if today's run was missed (e.g. service restarted after 08:45) ---
+    now = datetime.now(IST)
+    today_str = now.strftime("%Y-%m-%d")
+    past_target = now.hour > TARGET_HOUR or (now.hour == TARGET_HOUR and now.minute >= TARGET_MINUTE)
 
-                im = get_instrument_master()
-                scrip = await fetch_and_parse_scrip_master(
-                    creds, settings.redis_url,
-                    consumer_key=settings.kotak_consumer_key,
-                    instruments=im,
-                )
+    if past_target:
+        last_run = await cache_get(settings.redis_url, CRON_RAN_KEY)
+        if last_run != today_str:
+            logger.info("scrip_master_cron.catchup", reason="missed today's scheduled run")
+            try:
+                if await _run_scrip_master_download(settings):
+                    await cache_set(settings.redis_url, CRON_RAN_KEY, today_str, ttl=86400)
+            except Exception:
+                logger.exception("scrip_master_cron.catchup_failed")
 
-                connector = KotakNeoConnector(settings, creds, spot_tokens=im.spot_tokens())
-                connector.token_to_symbol = scrip.token_to_symbol
-                logger.info("kotak_neo connector initialised via auth event")
-
-                # Start streaming (no auto-subscribe — SubscriptionManager handles it)
-                asyncio.create_task(
-                    _run_connector(connector, publisher, aggregator)
-                )
-
-                # Set up on-demand subscription manager
-                from market_data_service.subscription_manager import SubscriptionManager
-
-                sub_mgr = SubscriptionManager(connector, scrip, instruments=im)
-
-                # Subscribe to index spot prices after connection stabilises
-                async def _init_indices():
-                    await asyncio.sleep(2)
-                    await sub_mgr.subscribe_indices()
-                asyncio.create_task(_init_indices())
-
-                # Listen for on-demand subscription requests from the API gateway
-                asyncio.create_task(
-                    _watch_subscribe_requests(settings, sub_mgr)
-                )
-
-                # Start Kotak realtime WS for order/position streaming
-                from market_data_service.connectors.kotak_realtime import KotakRealtimeConnector
-
-                realtime = KotakRealtimeConnector(creds, settings.redis_url)
-                asyncio.create_task(realtime.start())
-
-                # Periodically flush static OHLC data to Redis
-                asyncio.create_task(
-                    _flush_static_data(settings, connector)
-                )
-    except asyncio.CancelledError:
-        return
-    except Exception:
-        logger.exception("kotak auth watcher failed")
-
-
-async def _flush_static_data(settings: MarketDataSettings, connector) -> None:
-    """Periodically cache static OHLC data (open, prev close, high, low) to Redis."""
-    import json
-    from datetime import datetime, timezone
-    from shared.redis_client import cache_set
-
-    today_str = ""
+    # --- Daily loop ---
     while True:
-        await asyncio.sleep(5)
         try:
-            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            static = connector.get_static_data()
-            if not static:
-                continue
+            now = datetime.now(IST)
+            target = now.replace(hour=TARGET_HOUR, minute=TARGET_MINUTE, second=0, microsecond=0)
+            if now >= target:
+                target += timedelta(days=1)
+            wait_seconds = (target - now).total_seconds()
+            logger.info("scrip_master_cron.scheduled", next_run=target.isoformat(), wait_s=int(wait_seconds))
+            await asyncio.sleep(wait_seconds)
 
-            # Cache per-symbol static data with date tag for invalidation
-            for symbol, info in static.items():
-                info["date"] = now_str
-                key = f"cache:static:{symbol}"
-                await cache_set(
-                    settings.redis_url, key,
-                    json.dumps(info),
-                    ttl=86400,  # 24h — invalidated by date check
-                )
-
-            if now_str != today_str:
-                today_str = now_str
-                logger.info("static_data.flushed", symbols=len(static), date=now_str)
+            if await _run_scrip_master_download(settings):
+                run_date = datetime.now(IST).strftime("%Y-%m-%d")
+                await cache_set(settings.redis_url, CRON_RAN_KEY, run_date, ttl=86400)
         except asyncio.CancelledError:
             return
         except Exception:
-            logger.exception("static_data.flush_error")
-
-
-async def _watch_subscribe_requests(
-    settings: MarketDataSettings,
-    sub_mgr,
-) -> None:
-    """Listen for on-demand subscription requests from the API gateway."""
-    import json
-    try:
-        async with get_redis(settings.redis_url) as client:
-            pubsub = client.pubsub()
-            await pubsub.subscribe("subscribe:request")
-            logger.info("subscribe_request.watcher_started")
-            async for message in pubsub.listen():
-                if message["type"] != "message":
-                    continue
-                try:
-                    data = json.loads(message["data"])
-                    underlying = data["underlying"]
-                    expiry = data["expiry"]
-                    newly = await sub_mgr.ensure_subscribed(underlying, expiry)
-                    if newly:
-                        logger.info("subscribe_request.fulfilled", underlying=underlying, expiry=expiry)
-                except (json.JSONDecodeError, KeyError):
-                    logger.warning("subscribe_request.invalid")
-    except asyncio.CancelledError:
-        return
-    except Exception:
-        logger.exception("subscribe_request.watcher_failed")
+            logger.exception("scrip_master_cron.failed")
+            await asyncio.sleep(60)
 
 
 async def _shutdown(loop: asyncio.AbstractEventLoop) -> None:
@@ -199,8 +120,10 @@ async def main() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda: asyncio.ensure_future(_shutdown(loop)))
 
+    watcher = SessionWatcher(settings, publisher, aggregator)
     await asyncio.gather(
-        _watch_kotak_auth(settings, publisher, aggregator),
+        watcher.run(),
+        _daily_scrip_master_refresh(settings),
     )
 
 

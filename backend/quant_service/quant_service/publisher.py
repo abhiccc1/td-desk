@@ -57,17 +57,45 @@ class ResultPublisher:
                 expiry = payload.get("expiry", "unknown")
                 return f"greeks:batch:{underlying}:{expiry}"
 
-            case EventType.STRATEGY_RESULT:
-                basket_id = payload.get("basket_id", "unknown")
-                return f"strategy:result:{basket_id}"
-
-            case EventType.RISK_EXPOSURE:
-                return "risk:exposure"
+            case EventType.CALIBRATION_COMPLETED:
+                underlying = payload.get("underlying", "unknown")
+                expiry = payload.get("expiry", "unknown")
+                return f"calibration:completed:{underlying}:{expiry}"
 
             case EventType.MODEL_PRICES_COMPUTED:
                 underlying = payload.get("underlying", "unknown")
                 expiry = payload.get("expiry", "unknown")
                 return f"model:prices:{underlying}:{expiry}"
+
+            case EventType.MODEL_PRICES_SLOW_COMPUTED:
+                underlying = payload.get("underlying", "unknown")
+                expiry = payload.get("expiry", "unknown")
+                return f"model:analytics:{underlying}:{expiry}"
+
+            case EventType.POSITION_GREEKS_BATCH_COMPUTED:
+                underlying = payload.get("underlying", "unknown")
+                expiry = payload.get("expiry", "unknown")
+                return f"greeks:position_batch:{underlying}:{expiry}"
+
+            case EventType.VRP_COMPUTED:
+                underlying = payload.get("underlying", "unknown")
+                return f"vrp:computed:{underlying}"
+
+            case EventType.STRATEGY_RESULT:
+                legs = payload.get("legs")
+                if isinstance(legs, list):
+                    first_leg = next(
+                        (leg for leg in legs if isinstance(leg, dict)),
+                        {},
+                    )
+                else:
+                    first_leg = {}
+                underlying = first_leg.get("underlying", "unknown")
+                expiry = first_leg.get("expiry", "unknown")
+                return f"strategy:result:{underlying}:{expiry}"
+
+            case EventType.RISK_EXPOSURE:
+                return "risk:exposure"
 
             case _:
                 return None

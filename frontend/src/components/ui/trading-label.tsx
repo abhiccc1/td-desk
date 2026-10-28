@@ -22,10 +22,10 @@ function OptionTypeBadge({ optionType, className }: OptionTypeBadgeProps) {
     <Badge
       variant="secondary"
       className={cn(
-        "px-1.5 py-0.5 text-[10px] font-bold",
+        "border-transparent px-1.5 py-0.5 text-[10px] font-bold text-white",
         optionType === "CE"
-          ? "bg-blue-500/20 text-blue-400"
-          : "bg-violet-500/20 text-violet-400",
+          ? "bg-green-600"
+          : "bg-red-600",
         className,
       )}
     >

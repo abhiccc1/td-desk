@@ -1,11 +1,10 @@
 "use client";
 
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef } from "react";
 import { AgGridReact } from "ag-grid-react";
 import type {
   ColDef,
   CellClassParams,
-  CellClickedEvent,
   GetRowIdParams,
   GridReadyEvent,
   GridApi,
@@ -15,11 +14,28 @@ import "ag-grid-community/styles/ag-theme-alpine.css";
 import "@/lib/ag-grid-setup";
 
 import { useGreeksStore } from "@/stores/greeks-store";
+import { useBasketStore } from "@/stores/basket-store";
 import { useMarketDataStore } from "@/stores/market-data-store";
-import type { GreeksResult, ModelPricesResult, OptionChainSnapshot, OptionStrike, SviParams, TickData } from "@/types/market-data";
-import { bsPrice } from "@/lib/black-scholes";
+import { usePositionStore } from "@/stores/position-store";
+import type {
+  GreeksResult,
+  ModelPricesResult,
+  OptionChainSnapshot,
+  OptionStrike,
+  OptionType,
+  Side,
+  SviParams,
+  TickData,
+} from "@/types/market-data";
+import { modelPrice } from "@/lib/black-scholes";
+import type { OptionModel } from "@/lib/black-scholes";
+import { pricingModelOf, timeToExpiryYears, underlyingPriceLabel } from "@/lib/instruments";
+
 
 const RISK_FREE_RATE = 0.065;
+
+/** Stable empty array — avoids AG Grid re-processing rowData on every render. */
+const EMPTY_ROW_DATA: OptionChainRow[] = [];
 
 export interface OptionChainRow {
   strike: number;
@@ -29,16 +45,25 @@ export interface OptionChainRow {
   callSviIv: number | null;
   callHestonIv: number | null;
   callVgIv: number | null;
+  callHestonEdge: number | null;   // hestonIv - marketIv (positive = cheap, buy signal)
+  callVgEdge: number | null;       // vgIv - marketIv
   callIvDiff: number | null;
   callDelta: number | null;
+  callGamma: number | null;
   putDelta: number | null;
+  putGamma: number | null;
   putIvDiff: number | null;
   putSviIv: number | null;
   putHestonIv: number | null;
   putVgIv: number | null;
+  putHestonEdge: number | null;
+  putVgEdge: number | null;
   putIv: number | null;
   putFair: number | null;
   putLtp: number | null;
+  /** Position qty on this strike (negative = short) */
+  callPosQty?: number;
+  putPosQty?: number;
   /** Marker for the spot-price divider row */
   _isSpotDivider?: boolean;
   _isCallItm?: boolean;
@@ -47,6 +72,7 @@ export interface OptionChainRow {
   _spotPctChange?: number;
 }
 
+
 const PATCHABLE_FIELDS: (keyof OptionChainRow)[] = [
   "callLtp",
   "callFair",
@@ -54,16 +80,24 @@ const PATCHABLE_FIELDS: (keyof OptionChainRow)[] = [
   "callSviIv",
   "callHestonIv",
   "callVgIv",
+  "callHestonEdge",
+  "callVgEdge",
   "callIvDiff",
   "callDelta",
+  "callGamma",
   "putDelta",
+  "putGamma",
   "putIvDiff",
   "putSviIv",
   "putHestonIv",
   "putVgIv",
+  "putVgEdge",
+  "putHestonEdge",
   "putIv",
   "putFair",
   "putLtp",
+  "callPosQty",
+  "putPosQty",
 ];
 
 /** Build model IV lookup map from store's modelPrices. */
@@ -96,6 +130,9 @@ function strikeToRow(
   greeksMap: Map<string, GreeksResult>,
   modelIvMap: Map<number, { hestonIv: number | null; vgIv: number | null }>,
   liveTicks: Map<string, TickData>,
+  modelMeta: { hestonCalibrated: boolean; vgCalibrated: boolean } | null,
+  // BSM on spot for index options; Black-76 on the future for MCX
+  model: OptionModel = "bsm",
 ): OptionChainRow {
   const callTick = s.call ? (liveTicks.get(s.call.symbol) ?? s.call) : null;
   const putTick = s.put ? (liveTicks.get(s.put.symbol) ?? s.put) : null;
@@ -114,18 +151,27 @@ function strikeToRow(
   const callIvDiff = callMarketIv !== null && callSviIv !== null ? callMarketIv - callSviIv : null;
   const putIvDiff = putMarketIv !== null && putSviIv !== null ? putMarketIv - putSviIv : null;
 
-  // Fair value from SVI IV + BSM pricing
+  // Fair value from SVI IV + BSM (index) / Black-76 (futures) pricing
   const callFair = callSviIv !== null && spot > 0 && t > 0
-    ? bsPrice(spot, s.strike, t, RISK_FREE_RATE, callSviIv / 100, "CE")
+    ? modelPrice(model, spot, s.strike, t, RISK_FREE_RATE, callSviIv / 100, "CE")
     : null;
   const putFair = putSviIv !== null && spot > 0 && t > 0
-    ? bsPrice(spot, s.strike, t, RISK_FREE_RATE, putSviIv / 100, "PE")
+    ? modelPrice(model, spot, s.strike, t, RISK_FREE_RATE, putSviIv / 100, "PE")
     : null;
 
   // Model IVs from Heston/VG FFT pricing
   const modelIvs = modelIvMap.get(s.strike);
   const hestonIvPct = modelIvs?.hestonIv != null ? modelIvs.hestonIv * 100 : null;
   const vgIvPct = modelIvs?.vgIv != null ? modelIvs.vgIv * 100 : null;
+
+  const callHestonEdge = modelMeta?.hestonCalibrated && hestonIvPct !== null && callMarketIv !== null
+    ? hestonIvPct - callMarketIv : null;
+  const callVgEdge = modelMeta?.vgCalibrated && vgIvPct !== null && callMarketIv !== null
+    ? vgIvPct - callMarketIv : null;
+  const putHestonEdge = modelMeta?.hestonCalibrated && hestonIvPct !== null && putMarketIv !== null
+    ? hestonIvPct - putMarketIv : null;
+  const putVgEdge = modelMeta?.vgCalibrated && vgIvPct !== null && putMarketIv !== null
+    ? vgIvPct - putMarketIv : null;
 
   return {
     strike: s.strike,
@@ -135,13 +181,19 @@ function strikeToRow(
     callSviIv,
     callHestonIv: hestonIvPct,
     callVgIv: vgIvPct,
+    callHestonEdge,
+    callVgEdge,
     callIvDiff,
     callDelta: callGreeks?.delta ?? null,
+    callGamma: callGreeks?.gamma ?? null,
     putDelta: putGreeks?.delta ?? null,
+    putGamma: putGreeks?.gamma ?? null,
     putIvDiff,
     putSviIv,
     putHestonIv: hestonIvPct,
     putVgIv: vgIvPct,
+    putHestonEdge,
+    putVgEdge,
     putIv: putMarketIv ?? putSviIv,
     putFair,
     putLtp: putTick?.ltp ?? null,
@@ -166,13 +218,19 @@ function buildSpotDivider(
     callSviIv: null,
     callHestonIv: null,
     callVgIv: null,
+    callHestonEdge: null,
+    callVgEdge: null,
     callIvDiff: null,
     callDelta: null,
+    callGamma: null,
     putDelta: null,
+    putGamma: null,
     putIvDiff: null,
     putSviIv: null,
     putHestonIv: null,
     putVgIv: null,
+    putHestonEdge: null,
+    putVgEdge: null,
     putIv: null,
     putFair: null,
     putLtp: null,
@@ -196,13 +254,39 @@ function hasSameStrikeStructure(
   return true;
 }
 
+/**
+ * Estimate spot from put-call parity when the index feed gives no underlying
+ * price (e.g. a missing/degraded index spot tick). Near the forward,
+ * call.ltp ≈ put.ltp, so the dual-quoted strike that minimises |C − P| sits
+ * closest to ATM and approximates spot well enough to anchor the chain view.
+ * Returns -1 when no strike has both a call and a put quote.
+ */
+function estimateSpotFromParity(strikes: OptionStrike[]): number {
+  let bestStrike = -1;
+  let bestDiff = Infinity;
+  for (const entry of strikes) {
+    const call = entry.call?.ltp;
+    const put = entry.put?.ltp;
+    if (call == null || put == null || call <= 0 || put <= 0) continue;
+    const diff = Math.abs(call - put);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      bestStrike = entry.strike;
+    }
+  }
+  return bestStrike;
+}
+
 function computeDividerIndex(
   strikes: OptionStrike[],
   spot: number,
 ): number {
-  if (spot <= 0) return -1;
+  // Fall back to a parity-implied ATM when the feed has no spot, so the chain
+  // still centres on the tradeable strikes instead of the lowest strike.
+  const ref = spot > 0 ? spot : estimateSpotFromParity(strikes);
+  if (ref <= 0) return -1;
   for (let idx = 0; idx < strikes.length; idx += 1) {
-    if (strikes[idx].strike > spot) return idx;
+    if (strikes[idx].strike > ref) return idx;
   }
   return strikes.length;
 }
@@ -229,21 +313,31 @@ function buildRowsForChain(
   modelPrices: ModelPricesResult | null,
   greeksMap: Map<string, GreeksResult>,
   liveTicks: Map<string, TickData>,
+  posMap?: Map<string, number>,
 ): { rows: OptionChainRow[]; strikeMap: Map<number, OptionStrike>; symbolToStrike: Map<string, number>; dividerIdx: number } {
   const spot = chain.underlyingPrice;
-  // IST market close = 3:30 PM IST = 10:00 AM UTC
-  const expiryClose = new Date(chain.expiry + "T10:00:00Z").getTime();
-  const expiryMs = expiryClose - Date.now();
-  const t = Math.max(expiryMs / (365.25 * 86400_000), 1e-6);
+  // 15:30 IST for NSE/BSE, MCX evening close for commodities
+  const t = timeToExpiryYears(chain.underlying, chain.expiry);
+  const model = pricingModelOf(chain.underlying);
   const modelIvMap = buildModelIvMap(modelPrices);
+  const modelMeta = modelPrices ? { hestonCalibrated: modelPrices.hestonCalibrated, vgCalibrated: modelPrices.vgCalibrated } : null;
   const strikeMap = new Map<number, OptionStrike>();
   const symbolToStrike = new Map<string, number>();
   const dataRows = chain.strikes.map((strikeEntry) => {
     strikeMap.set(strikeEntry.strike, strikeEntry);
     if (strikeEntry.call) symbolToStrike.set(strikeEntry.call.symbol, strikeEntry.strike);
     if (strikeEntry.put) symbolToStrike.set(strikeEntry.put.symbol, strikeEntry.strike);
-    return strikeToRow(strikeEntry, svi, spot, t, greeksMap, modelIvMap, liveTicks);
+    return strikeToRow(strikeEntry, svi, spot, t, greeksMap, modelIvMap, liveTicks, modelMeta, model);
   });
+
+  if (posMap && posMap.size > 0) {
+    for (const row of dataRows) {
+      const cq = posMap.get(`${row.strike}-CE`);
+      const pq = posMap.get(`${row.strike}-PE`);
+      if (cq) row.callPosQty = cq;
+      if (pq) row.putPosQty = pq;
+    }
+  }
 
   const rows: OptionChainRow[] = [];
   const divider = buildSpotDivider(spot, spotStaticPrevClose);
@@ -279,6 +373,7 @@ function rowChanged(prev: OptionChainRow | undefined, next: OptionChainRow): boo
   return false;
 }
 
+
 function patchRowNode(
   rowNode: { setDataValue: (colKey: string, newValue: unknown) => void },
   prev: OptionChainRow | undefined,
@@ -299,6 +394,17 @@ const ivDiffClass = (params: CellClassParams<OptionChainRow>): string => {
   if (value < -2) return "text-green-400 font-semibold";  // significantly cheap
   if (value < -0.5) return "text-green-400/70";            // mildly cheap
   return "text-[#808090]";                                 // near fair value
+};
+
+/** Model edge: positive = cheap (green/buy), negative = expensive (red/sell) */
+const modelEdgeClass = (params: CellClassParams<OptionChainRow>): string => {
+  const value = params.value as number | null;
+  if (value === null || value === undefined) return "";
+  if (value > 2) return "text-green-400 font-semibold";
+  if (value > 0.5) return "text-green-400/70";
+  if (value < -2) return "text-red-400 font-semibold";
+  if (value < -0.5) return "text-red-400/70";
+  return "text-[#808090]";
 };
 
 const ivDiffFormatter = (p: { value: unknown }) => {
@@ -329,16 +435,158 @@ const deltaClass = (params: CellClassParams<OptionChainRow>): string => {
   return "";
 };
 
-const CLICKABLE_FIELDS = new Set(["callLtp", "putLtp"]);
+const gammaClass = (params: CellClassParams<OptionChainRow>): string => {
+  const value = params.value as number | null;
+  if (value === null || value === undefined) return "";
+  if (value > 0) return "text-green-400";
+  if (value < 0) return "text-red-400";
+  return "";
+};
 
-function clickableCellClass(
+const CALL_SIDE_FIELDS = [
+  "callDelta",
+  "callGamma",
+  "callIv",
+  "callSviIv",
+  "callHestonIv",
+  "callVgIv",
+  "callHestonEdge",
+  "callVgEdge",
+  "callIvDiff",
+  "callFair",
+  "callLtp",
+] as const;
+
+const PUT_SIDE_FIELDS = [
+  "putLtp",
+  "putFair",
+  "putIvDiff",
+  "putVgEdge",
+  "putHestonEdge",
+  "putVgIv",
+  "putHestonIv",
+  "putSviIv",
+  "putIv",
+  "putDelta",
+  "putGamma",
+] as const;
+
+function addLegFromOptionCell(
+  strike: number,
+  optionType: OptionType,
+  side: Side,
+  premium: number,
+): void {
+  const { selectedUnderlying, selectedExpiry } = useMarketDataStore.getState();
+  if (!selectedUnderlying || !selectedExpiry) return;
+
+  useBasketStore.getState().addLegFromChain({
+    strike,
+    optionType,
+    side,
+    premium,
+    underlying: selectedUnderlying,
+    expiry: selectedExpiry,
+  });
+}
+
+function StrikeCellRenderer(params: { value: unknown; data?: OptionChainRow }) {
+  if (params.data?._isSpotDivider) return null;
+  const strike = params.value as number;
+  const cq = params.data?.callPosQty;
+  const pq = params.data?.putPosQty;
+  return (
+    <div className="relative flex items-center justify-center">
+      {cq ? (
+        <span className={`absolute left-0 text-[9px] font-semibold ${cq > 0 ? "text-green-400" : "text-red-400"}`}>
+          {cq > 0 ? `+${cq}` : cq}
+        </span>
+      ) : null}
+      <span>{strike}</span>
+      {pq ? (
+        <span className={`absolute right-0 text-[9px] font-semibold ${pq > 0 ? "text-green-400" : "text-red-400"}`}>
+          {pq > 0 ? `+${pq}` : pq}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
+function OptionActionCellRenderer(params: {
+  value: unknown;
+  valueFormatted?: string | null;
+  data?: OptionChainRow;
+  colDef: { field?: string | null };
+  context?: { activeLegSet?: Set<string> };
+}) {
+  const field = params.colDef.field;
+  const value = params.value;
+
+  if (!field || !params.data) {
+    return params.valueFormatted ?? (value != null ? String(value) : "");
+  }
+
+  const strike = params.data?.strike;
+  const optionType: OptionType = field.startsWith("call") ? "CE" : "PE";
+  const premium = optionType === "CE" ? params.data.callLtp : params.data.putLtp;
+  const activeLegSet = params.context?.activeLegSet;
+  const buyActive = strike !== undefined && !!activeLegSet?.has(`${strike}-${optionType}-BUY`);
+  const sellActive = strike !== undefined && !!activeLegSet?.has(`${strike}-${optionType}-SELL`);
+  const displayValue = params.valueFormatted ?? (value != null ? String(value) : "");
+
+  const handleAdd = (event: React.MouseEvent<HTMLButtonElement>, side: Side) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (strike === undefined || premium == null) return;
+    addLegFromOptionCell(strike, optionType, side, premium);
+  };
+
+  return (
+    <div className="relative flex h-full w-full items-center justify-center overflow-hidden px-1">
+      <span className="option-action-value tabular-nums transition-opacity duration-150">
+        {displayValue}
+      </span>
+      <div className="option-action-buttons pointer-events-none absolute inset-y-0 left-1 flex items-center gap-1 opacity-0 transition-opacity duration-150">
+        <button
+          type="button"
+          title="Add buy leg"
+          onClick={(event) => handleAdd(event, "BUY")}
+          disabled={premium == null}
+          className={`pointer-events-auto flex h-6 w-6 items-center justify-center rounded-md text-[10px] font-bold text-white shadow-sm transition-colors ${
+            buyActive ? "bg-emerald-400 text-[#052e16]" : "bg-emerald-500/95 hover:bg-emerald-400"
+          }`}
+        >
+          B
+        </button>
+        <button
+          type="button"
+          title="Add sell leg"
+          onClick={(event) => handleAdd(event, "SELL")}
+          disabled={premium == null}
+          className={`pointer-events-auto flex h-6 w-6 items-center justify-center rounded-md text-[10px] font-bold text-white shadow-sm transition-colors ${
+            sellActive ? "bg-rose-400 text-[#3f0d12]" : "bg-rose-500/95 hover:bg-rose-400"
+          }`}
+        >
+          S
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function optionActionCellClass(
   params: CellClassParams<OptionChainRow>,
 ): string[] {
   const classes: string[] = [];
   const field = params.colDef.field;
-  if (!field || !CLICKABLE_FIELDS.has(field)) return classes;
+  if (!field || params.data?._isSpotDivider) return classes;
+  if (!field.startsWith("call") && !field.startsWith("put")) return classes;
 
-  classes.push("cell-clickable");
+  const optionType: OptionType = field.startsWith("call") ? "CE" : "PE";
+  const premium = optionType === "CE" ? params.data?.callLtp : params.data?.putLtp;
+  if (premium == null) return classes;
+
+  classes.push("option-action-cell");
 
   const activeLegSet = params.context?.activeLegSet as Set<string> | undefined;
   if (!activeLegSet || activeLegSet.size === 0) return classes;
@@ -346,13 +594,8 @@ function clickableCellClass(
   const strike = params.data?.strike;
   if (strike === undefined) return classes;
 
-  if (field === "callLtp") {
-    if (activeLegSet.has(`${strike}-CE-BUY`)) classes.push("cell-leg-buy");
-    else if (activeLegSet.has(`${strike}-CE-SELL`)) classes.push("cell-leg-sell");
-  } else if (field === "putLtp") {
-    if (activeLegSet.has(`${strike}-PE-BUY`)) classes.push("cell-leg-buy");
-    else if (activeLegSet.has(`${strike}-PE-SELL`)) classes.push("cell-leg-sell");
-  }
+  if (activeLegSet.has(`${strike}-${optionType}-BUY`)) classes.push("cell-leg-buy");
+  else if (activeLegSet.has(`${strike}-${optionType}-SELL`)) classes.push("cell-leg-sell");
 
   return classes;
 }
@@ -360,63 +603,91 @@ function clickableCellClass(
 // Toggleable column groups — each key controls a call+put column pair
 const COLUMN_TOGGLES = [
   { key: "delta", label: "Delta" },
+  { key: "gamma", label: "Gamma" },
   { key: "iv", label: "IV" },
   { key: "svi", label: "SVI" },
   { key: "heston", label: "Heston" },
   { key: "vg", label: "VG" },
+  { key: "hestonEdge", label: "H-Edge" },
+  { key: "vgEdge", label: "V-Edge" },
   { key: "edge", label: "Edge" },
   { key: "fair", label: "Fair" },
 ] as const;
 
-type ColumnToggleKey = typeof COLUMN_TOGGLES[number]["key"];
+export type ColumnToggleKey = typeof COLUMN_TOGGLES[number]["key"];
 
 const COLUMN_KEY_TO_FIELDS: Record<ColumnToggleKey, string[]> = {
   delta: ["callDelta", "putDelta"],
+  gamma: ["callGamma", "putGamma"],
   iv: ["callIv", "putIv"],
   svi: ["callSviIv", "putSviIv"],
   heston: ["callHestonIv", "putHestonIv"],
   vg: ["callVgIv", "putVgIv"],
+  hestonEdge: ["callHestonEdge", "putHestonEdge"],
+  vgEdge: ["callVgEdge", "putVgEdge"],
   edge: ["callIvDiff", "putIvDiff"],
   fair: ["callFair", "putFair"],
 };
 
 const STORAGE_KEY = "oc-visible-columns";
 
-function loadVisibleColumns(): Set<ColumnToggleKey> {
+export function loadVisibleColumns(): Set<ColumnToggleKey> {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const arr = JSON.parse(raw) as string[];
-      return new Set(arr.filter((k) => COLUMN_TOGGLES.some((t) => t.key === k)) as ColumnToggleKey[]);
+      const next = new Set(arr.filter((k) => COLUMN_TOGGLES.some((t) => t.key === k)) as ColumnToggleKey[]);
+      // Schema upgrade: gamma is part of the default Greek view alongside delta.
+      if (next.has("delta")) next.add("gamma");
+      return next;
     }
   } catch {}
-  // Default: LTP, Strike always shown; Delta + IV visible
-  return new Set<ColumnToggleKey>(["delta", "iv"]);
+  // Default: LTP, Strike always shown; Delta + Gamma + IV visible
+  return new Set<ColumnToggleKey>(["delta", "gamma", "iv"]);
 }
 
-function saveVisibleColumns(cols: Set<ColumnToggleKey>) {
+export function saveVisibleColumns(cols: Set<ColumnToggleKey>) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify([...cols]));
 }
 
 interface OptionChainGridProps {
-  onCellClicked?: (event: CellClickedEvent) => void;
   activeLegSet?: Set<string>;
+  visibleColumns: Set<ColumnToggleKey>;
+}
+
+interface OptionChainColumnTogglesProps {
+  visibleColumns: Set<ColumnToggleKey>;
+  onToggleColumn: (key: ColumnToggleKey) => void;
+}
+
+export function OptionChainColumnToggles({
+  visibleColumns,
+  onToggleColumn,
+}: OptionChainColumnTogglesProps) {
+  return (
+    <div className="flex flex-wrap items-center gap-1">
+      <span className="mr-1 text-[10px] uppercase tracking-[0.2em] text-[#7f8aa9]">Cols</span>
+      {COLUMN_TOGGLES.map((toggle) => (
+        <button
+          key={toggle.key}
+          onClick={() => onToggleColumn(toggle.key)}
+          className={`rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors ${
+            visibleColumns.has(toggle.key)
+              ? "bg-blue-500/20 text-blue-300"
+              : "text-[#8f96af] hover:text-[#d5dbef]"
+          }`}
+        >
+          {toggle.label}
+        </button>
+      ))}
+    </div>
+  );
 }
 
 export const OptionChainGrid = memo(function OptionChainGrid({
-  onCellClicked,
   activeLegSet,
+  visibleColumns,
 }: OptionChainGridProps) {
-  const [visibleColumns, setVisibleColumns] = useState<Set<ColumnToggleKey>>(loadVisibleColumns);
-
-  const toggleColumn = useCallback((key: ColumnToggleKey) => {
-    setVisibleColumns((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) next.delete(key); else next.add(key);
-      saveVisibleColumns(next);
-      return next;
-    });
-  }, []);
   const gridRef = useRef<AgGridReact<OptionChainRow>>(null);
   const apiRef = useRef<GridApi<OptionChainRow> | null>(null);
   const rowsByIdRef = useRef<Map<string, OptionChainRow>>(new Map());
@@ -430,6 +701,9 @@ export const OptionChainGrid = memo(function OptionChainGrid({
   const scrollingUntilRef = useRef(0);
   const pendingStrikeFlushRef = useRef<number | null>(null);
   const pendingStrikeUpdatesRef = useRef<Set<number>>(new Set());
+  const gridContainerRef = useRef<HTMLDivElement>(null);
+  const viewportElRef = useRef<HTMLElement | null>(null);
+  const lastUserScrollTopRef = useRef(0);
 
   const priceFormatter = useCallback(
     (p: { value: unknown }) =>
@@ -440,6 +714,18 @@ export const OptionChainGrid = memo(function OptionChainGrid({
   const ivFormatter = useCallback(
     (p: { value: unknown }) =>
       p.value != null ? `${(p.value as number).toFixed(1)}%` : "",
+    [],
+  );
+
+  const gammaFormatter = useCallback(
+    (p: { value: unknown }) =>
+      p.value != null ? (p.value as number).toFixed(4) : "",
+    [],
+  );
+
+  const deltaFormatter = useCallback(
+    (p: { value: unknown }) =>
+      p.value != null ? (p.value as number).toFixed(2) : "",
     [],
   );
 
@@ -454,32 +740,58 @@ export const OptionChainGrid = memo(function OptionChainGrid({
     return set;
   }, [visibleColumns]);
 
+  const actionAnchorFields = useMemo(() => {
+    const callField = CALL_SIDE_FIELDS.find((field) => !hiddenFields.has(field)) ?? "callLtp";
+    const putField = PUT_SIDE_FIELDS.find((field) => !hiddenFields.has(field)) ?? "putLtp";
+    return new Set<string>([callField, putField]);
+  }, [hiddenFields]);
+
+  const withActionAnchor = useCallback((col: ColDef<OptionChainRow>): ColDef<OptionChainRow> => {
+    if (!col.field || !actionAnchorFields.has(col.field)) return col;
+    return {
+      ...col,
+      cellRenderer: OptionActionCellRenderer,
+      cellClass: optionActionCellClass,
+    };
+  }, [actionAnchorFields]);
+
   const allColumnDefs = useMemo<ColDef<OptionChainRow>[]>(
     () => [
-      { headerName: "Delta", field: "callDelta", flex: 1, minWidth: 55, type: "numericColumn", cellClass: deltaClass, headerClass: "ag-header-center ag-header-call" },
+      { headerName: "Delta", field: "callDelta", flex: 1, minWidth: 55, type: "numericColumn", valueFormatter: deltaFormatter, cellClass: deltaClass, headerClass: "ag-header-center ag-header-call" },
+      { headerName: "Gamma", field: "callGamma", flex: 1, minWidth: 60, type: "numericColumn", valueFormatter: gammaFormatter, cellClass: gammaClass, headerClass: "ag-header-center ag-header-call" },
       { headerName: "IV", field: "callIv", flex: 1, minWidth: 50, type: "numericColumn", valueFormatter: ivFormatter, headerClass: "ag-header-center ag-header-call" },
       { headerName: "SVI", field: "callSviIv", flex: 1, minWidth: 50, type: "numericColumn", valueFormatter: ivFormatter, headerClass: "ag-header-center ag-header-call", cellClass: "text-panel-faint" },
-      { headerName: "Heston", field: "callHestonIv", flex: 1, minWidth: 50, type: "numericColumn", valueFormatter: ivFormatter, headerClass: "ag-header-center ag-header-call", cellClass: "text-orange-400/60" },
-      { headerName: "VG", field: "callVgIv", flex: 1, minWidth: 50, type: "numericColumn", valueFormatter: ivFormatter, headerClass: "ag-header-center ag-header-call", cellClass: "text-cyan-400/60" },
+      { headerName: "Heston", field: "callHestonIv", flex: 1, minWidth: 50, type: "numericColumn", valueFormatter: ivFormatter, headerClass: "ag-header-center ag-header-call", cellClass: "text-amber-400/60" },
+      { headerName: "VG", field: "callVgIv", flex: 1, minWidth: 50, type: "numericColumn", valueFormatter: ivFormatter, headerClass: "ag-header-center ag-header-call", cellClass: "text-pink-400/60" },
+      { headerName: "H-Edge", field: "callHestonEdge", flex: 1, minWidth: 55, type: "numericColumn", valueFormatter: ivDiffFormatter, cellClass: modelEdgeClass, headerClass: "ag-header-center ag-header-call" },
+      { headerName: "V-Edge", field: "callVgEdge", flex: 1, minWidth: 55, type: "numericColumn", valueFormatter: ivDiffFormatter, cellClass: modelEdgeClass, headerClass: "ag-header-center ag-header-call" },
       { headerName: "Edge", field: "callIvDiff", flex: 1, minWidth: 50, type: "numericColumn", valueFormatter: ivDiffFormatter, cellClass: ivDiffClass, headerClass: "ag-header-center ag-header-call" },
       { headerName: "Fair", field: "callFair", flex: 1, minWidth: 55, type: "numericColumn", valueFormatter: priceFormatter, cellClass: fairCellClass("callFair"), headerClass: "ag-header-center ag-header-call" },
-      { headerName: "Call LTP", field: "callLtp", flex: 1, minWidth: 70, type: "numericColumn", valueFormatter: priceFormatter, cellClass: clickableCellClass, headerClass: "ag-header-center ag-header-call" },
-      { headerName: "Strike", field: "strike", width: 80, cellClass: "font-bold text-yellow-300 text-center", headerClass: "ag-header-strike", type: "numericColumn", suppressSizeToFit: true },
-      { headerName: "Put LTP", field: "putLtp", flex: 1, minWidth: 70, type: "numericColumn", valueFormatter: priceFormatter, cellClass: clickableCellClass, headerClass: "ag-header-center ag-header-put" },
+      { headerName: "Call LTP", field: "callLtp", flex: 1, minWidth: 70, type: "numericColumn", valueFormatter: priceFormatter, headerClass: "ag-header-center ag-header-call" },
+      {
+        headerName: "Strike", field: "strike", width: 130, minWidth: 130,
+        cellClass: "font-bold text-yellow-300 text-center",
+        headerClass: "ag-header-strike", type: "numericColumn", suppressSizeToFit: true,
+        cellRenderer: StrikeCellRenderer,
+      },
+      { headerName: "Put LTP", field: "putLtp", flex: 1, minWidth: 70, type: "numericColumn", valueFormatter: priceFormatter, headerClass: "ag-header-center ag-header-put" },
       { headerName: "Fair", field: "putFair", flex: 1, minWidth: 55, type: "numericColumn", valueFormatter: priceFormatter, cellClass: fairCellClass("putFair"), headerClass: "ag-header-center ag-header-put" },
       { headerName: "Edge", field: "putIvDiff", flex: 1, minWidth: 50, type: "numericColumn", valueFormatter: ivDiffFormatter, cellClass: ivDiffClass, headerClass: "ag-header-center ag-header-put" },
-      { headerName: "VG", field: "putVgIv", flex: 1, minWidth: 50, type: "numericColumn", valueFormatter: ivFormatter, headerClass: "ag-header-center ag-header-put", cellClass: "text-cyan-400/60" },
-      { headerName: "Heston", field: "putHestonIv", flex: 1, minWidth: 50, type: "numericColumn", valueFormatter: ivFormatter, headerClass: "ag-header-center ag-header-put", cellClass: "text-orange-400/60" },
+      { headerName: "V-Edge", field: "putVgEdge", flex: 1, minWidth: 55, type: "numericColumn", valueFormatter: ivDiffFormatter, cellClass: modelEdgeClass, headerClass: "ag-header-center ag-header-put" },
+      { headerName: "H-Edge", field: "putHestonEdge", flex: 1, minWidth: 55, type: "numericColumn", valueFormatter: ivDiffFormatter, cellClass: modelEdgeClass, headerClass: "ag-header-center ag-header-put" },
+      { headerName: "VG", field: "putVgIv", flex: 1, minWidth: 50, type: "numericColumn", valueFormatter: ivFormatter, headerClass: "ag-header-center ag-header-put", cellClass: "text-pink-400/60" },
+      { headerName: "Heston", field: "putHestonIv", flex: 1, minWidth: 50, type: "numericColumn", valueFormatter: ivFormatter, headerClass: "ag-header-center ag-header-put", cellClass: "text-amber-400/60" },
       { headerName: "SVI", field: "putSviIv", flex: 1, minWidth: 50, type: "numericColumn", valueFormatter: ivFormatter, headerClass: "ag-header-center ag-header-put", cellClass: "text-panel-faint" },
       { headerName: "IV", field: "putIv", flex: 1, minWidth: 50, type: "numericColumn", valueFormatter: ivFormatter, headerClass: "ag-header-center ag-header-put" },
-      { headerName: "Delta", field: "putDelta", flex: 1, minWidth: 55, type: "numericColumn", cellClass: deltaClass, headerClass: "ag-header-center ag-header-put" },
+      { headerName: "Gamma", field: "putGamma", flex: 1, minWidth: 60, type: "numericColumn", valueFormatter: gammaFormatter, cellClass: gammaClass, headerClass: "ag-header-center ag-header-put" },
+      { headerName: "Delta", field: "putDelta", flex: 1, minWidth: 55, type: "numericColumn", valueFormatter: deltaFormatter, cellClass: deltaClass, headerClass: "ag-header-center ag-header-put" },
     ],
-    [priceFormatter, ivFormatter],
+    [priceFormatter, ivFormatter, gammaFormatter, deltaFormatter],
   );
 
   const columnDefs = useMemo(
-    () => allColumnDefs.filter((col) => !col.field || !hiddenFields.has(col.field)),
-    [allColumnDefs, hiddenFields],
+    () => allColumnDefs.filter((col) => !col.field || !hiddenFields.has(col.field)).map(withActionAnchor),
+    [allColumnDefs, hiddenFields, withActionAnchor],
   );
 
   const defaultColDef = useMemo<ColDef>(
@@ -513,7 +825,10 @@ export const OptionChainGrid = memo(function OptionChainGrid({
         <div className="spot-divider-row">
           <div className="spot-divider-line" />
           <div className="spot-divider-pill">
-            <span>Spot {spot.toLocaleString("en-IN", { maximumFractionDigits: 2 })}</span>
+            <span>
+              {underlyingPriceLabel(useMarketDataStore.getState().optionChain?.underlying)}{" "}
+              {spot.toLocaleString("en-IN", { maximumFractionDigits: 2 })}
+            </span>
             {chg !== 0 && (
               <span className={isUp ? "spot-change-up" : "spot-change-down"}>
                 {" "}{isUp ? "+" : ""}{chg.toFixed(2)} ({isUp ? "+" : ""}{pct.toFixed(2)}%)
@@ -539,6 +854,24 @@ export const OptionChainGrid = memo(function OptionChainGrid({
       return;
     }
 
+    // Build position map: "strike-CE" / "strike-PE" → net qty for matching underlying+expiry
+    // Position symbol format: "NIFTY 260319 22000 CE" — chain.expiry is "2026-03-19"
+    const chainExpiryCompact = chain.expiry.replace(/-/g, "").slice(2); // "2026-03-19" → "260319"
+    const posMap = new Map<string, number>();
+    const positions = usePositionStore.getState().positions;
+    for (const pos of positions) {
+      if (!pos.isOpen) continue;
+      const parts = pos.symbol.split(" ");
+      // parts: ["NIFTY", "260319", "22000", "CE"]
+      if (parts.length < 4) continue;
+      if (parts[0] !== chain.underlying) continue;
+      if (parts[1] !== chainExpiryCompact) continue;
+      const strike = parseFloat(parts[2]);
+      const ot = parts[3] === "CE" ? "CE" : "PE";
+      if (isNaN(strike)) continue;
+      posMap.set(`${strike}-${ot}`, (posMap.get(`${strike}-${ot}`) || 0) + pos.quantity);
+    }
+
     const { rows, strikeMap, symbolToStrike, dividerIdx } = buildRowsForChain(
       chain,
       marketState.sviParams,
@@ -546,6 +879,7 @@ export const OptionChainGrid = memo(function OptionChainGrid({
       marketState.modelPrices,
       useGreeksStore.getState().greeks,
       marketState.ticks,
+      posMap,
     );
 
     strikeMapRef.current = strikeMap;
@@ -565,16 +899,40 @@ export const OptionChainGrid = memo(function OptionChainGrid({
       nextRowOrder.length !== rowOrderRef.current.length ||
       nextRowOrder.some((id, idx) => id !== rowOrderRef.current[idx]);
 
+    // Determine if we should auto-center on the spot divider after update
+    const willAutoCenter = (chainChanged || !userScrolledRef.current) && dividerIdx >= 0;
+
+    // Helper: set row data while preserving scroll position
+    const setDataKeepScroll = (newRows: OptionChainRow[]) => {
+      if (willAutoCenter) {
+        api.setGridOption("rowData", newRows);
+        return;
+      }
+      if (!viewportElRef.current) {
+        viewportElRef.current = gridContainerRef.current?.querySelector('.ag-body-viewport') as HTMLElement | null;
+      }
+      const vp = viewportElRef.current;
+      const scrollTop = vp?.scrollTop ?? lastUserScrollTopRef.current;
+      api.setGridOption("rowData", newRows);
+      if (vp && scrollTop > 0) {
+        programmaticScrollUntilRef.current = Date.now() + 300;
+        vp.scrollTop = scrollTop;
+        requestAnimationFrame(() => {
+          vp.scrollTop = scrollTop;
+          requestAnimationFrame(() => { vp.scrollTop = scrollTop; });
+        });
+      }
+    };
+
     if (rowsByIdRef.current.size === 0 || chainChanged || orderChanged) {
-      // Initial load, underlying/expiry switch, or divider/row order changed.
-      api.setGridOption("rowData", rows);
+      setDataKeepScroll(rows);
     } else {
       for (const row of rows) {
         const id = rowIdFor(row);
         if (!rowChanged(rowsByIdRef.current.get(id), row)) continue;
         const rowNode = api.getRowNode(id);
         if (!rowNode) {
-          api.setGridOption("rowData", rows);
+          setDataKeepScroll(rows);
           break;
         }
         patchRowNode(rowNode, rowsByIdRef.current.get(id), row);
@@ -593,7 +951,6 @@ export const OptionChainGrid = memo(function OptionChainGrid({
     if (!userScrolledRef.current && dividerIdx >= 0) {
       requestAnimationFrame(() => {
         if (api.getDisplayedRowCount() > dividerIdx) {
-          // Suppress user-scroll detection for 300ms after programmatic scroll
           programmaticScrollUntilRef.current = Date.now() + 300;
           api.ensureIndexVisible(dividerIdx, "middle");
         }
@@ -601,7 +958,7 @@ export const OptionChainGrid = memo(function OptionChainGrid({
     }
   }, []);
 
-  const scheduleSyncRows = useCallback((api: GridApi<OptionChainRow>, delayMs = 48) => {
+  const scheduleSyncRows = useCallback((api: GridApi<OptionChainRow>, delayMs = 16) => {
     if (pendingSyncRef.current !== null) {
       window.clearTimeout(pendingSyncRef.current);
     }
@@ -625,9 +982,7 @@ export const OptionChainGrid = memo(function OptionChainGrid({
     if (!strikeEntry || !chain) return;
 
     const marketState = useMarketDataStore.getState();
-    const expiryClose = new Date(chain.expiry + "T10:00:00Z").getTime();
-    const expiryMs = expiryClose - Date.now();
-    const t = Math.max(expiryMs / (365.25 * 86400_000), 1e-6);
+    const t = timeToExpiryYears(chain.underlying, chain.expiry);
     const row = strikeToRow(
       strikeEntry,
       marketState.sviParams,
@@ -636,6 +991,8 @@ export const OptionChainGrid = memo(function OptionChainGrid({
       useGreeksStore.getState().greeks,
       buildModelIvMap(marketState.modelPrices),
       marketState.ticks,
+      marketState.modelPrices ? { hestonCalibrated: marketState.modelPrices.hestonCalibrated, vgCalibrated: marketState.modelPrices.vgCalibrated } : null,
+      pricingModelOf(chain.underlying),
     );
     const rowId = String(strike);
     const rowNode = api.getRowNode(rowId);
@@ -672,7 +1029,7 @@ export const OptionChainGrid = memo(function OptionChainGrid({
 
     pendingStrikeFlushRef.current = window.setTimeout(() => {
       flushStrikeUpdates(api);
-    }, 24);
+    }, 8);
   }, [flushStrikeUpdates]);
 
   const updateSpotRow = useCallback((api: GridApi<OptionChainRow>) => {
@@ -705,6 +1062,7 @@ export const OptionChainGrid = memo(function OptionChainGrid({
 
   const onGridReady = useCallback((event: GridReadyEvent<OptionChainRow>) => {
     apiRef.current = event.api;
+    viewportElRef.current = gridContainerRef.current?.querySelector('.ag-body-viewport') as HTMLElement | null;
     syncRows(event.api);
   }, [syncRows]);
 
@@ -728,7 +1086,7 @@ export const OptionChainGrid = memo(function OptionChainGrid({
         state.modelPrices !== prevState.modelPrices ||
         state.sviParams !== prevState.sviParams
       ) {
-        scheduleSyncRows(apiRef.current, 180);
+        scheduleSyncRows(apiRef.current, 80);
         return;
       }
 
@@ -743,10 +1101,6 @@ export const OptionChainGrid = memo(function OptionChainGrid({
         symbolToStrikeRef.current = symbolToStrike;
 
         if (rowsByIdRef.current.size === 0 || structureChanged || nextDividerIndex !== prevDividerIndex) {
-          // Spot crossed a strike boundary — reset scroll so grid re-centers
-          if (nextDividerIndex !== prevDividerIndex) {
-            userScrolledRef.current = false;
-          }
           scheduleSyncRows(apiRef.current);
         } else {
           updateSpotRow(apiRef.current);
@@ -779,6 +1133,14 @@ export const OptionChainGrid = memo(function OptionChainGrid({
       }
     });
 
+    // Re-sync when positions change so position highlights update
+    const unsubPositions = usePositionStore.subscribe((state, prevState) => {
+      if (!apiRef.current) return;
+      if (state.positions !== prevState.positions) {
+        scheduleSyncRows(apiRef.current, 100);
+      }
+    });
+
     return () => {
       if (pendingSyncRef.current !== null) {
         window.clearTimeout(pendingSyncRef.current);
@@ -788,6 +1150,7 @@ export const OptionChainGrid = memo(function OptionChainGrid({
       }
       unsubMarket();
       unsubGreeks();
+      unsubPositions();
     };
   }, [queueStrikeUpdate, scheduleSyncRows, updateSpotRow]);
 
@@ -820,56 +1183,44 @@ export const OptionChainGrid = memo(function OptionChainGrid({
           set.has(`${strike}-PE-SELL`)
         );
       },
+      "row-has-position": (params: { data?: OptionChainRow }) => {
+        if (params.data?._isSpotDivider) return false;
+        return !!(params.data?.callPosQty || params.data?.putPosQty);
+      },
     }),
     [],
   );
 
+  const handleBodyScroll = useCallback(() => {
+    scrollingUntilRef.current = Date.now() + 150;
+    if (Date.now() < programmaticScrollUntilRef.current) return;
+    userScrolledRef.current = true;
+    const vp = viewportElRef.current;
+    if (vp) lastUserScrollTopRef.current = vp.scrollTop;
+  }, []);
+
   return (
     <div className="flex h-full w-full flex-col">
-      {/* Column toggle bar */}
-      <div className="flex shrink-0 items-center gap-1 border-b border-panel-border bg-panel-header px-2 py-1">
-        <span className="mr-1 text-[10px] uppercase tracking-wider text-panel-dim">Cols</span>
-        {COLUMN_TOGGLES.map((t) => (
-          <button
-            key={t.key}
-            onClick={() => toggleColumn(t.key)}
-            className={`rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors ${
-              visibleColumns.has(t.key)
-                ? "bg-blue-500/20 text-blue-400"
-                : "text-panel-dim hover:text-panel-subtle"
-            }`}
-          >
-            {t.label}
-          </button>
-        ))}
-      </div>
-      <div className="ag-theme-alpine-dark min-h-0 flex-1">
+      <div ref={gridContainerRef} className="option-chain-grid ag-theme-alpine-dark min-h-0 flex-1">
       <AgGridReact<OptionChainRow>
         ref={gridRef}
         theme="legacy"
-        rowData={[]}
+        rowData={EMPTY_ROW_DATA}
         columnDefs={columnDefs}
         defaultColDef={defaultColDef}
         getRowId={getRowId}
         onGridReady={onGridReady}
-        onCellClicked={onCellClicked}
         context={context}
         rowClassRules={rowClassRules}
         isFullWidthRow={isFullWidthRow}
         fullWidthCellRenderer={fullWidthCellRenderer}
         animateRows={false}
-        asyncTransactionWaitMillis={50}
+        asyncTransactionWaitMillis={16}
         suppressScrollOnNewData
         suppressCellFocus
         headerHeight={32}
         rowHeight={28}
-        onBodyScroll={() => {
-          scrollingUntilRef.current = Date.now() + 150;
-          // Ignore scroll events caused by programmatic ensureIndexVisible
-          if (Date.now() < programmaticScrollUntilRef.current) return;
-          // User manually scrolled — stop auto-centering until next chain change
-          userScrolledRef.current = true;
-        }}
+        onBodyScroll={handleBodyScroll}
       />
       </div>
     </div>

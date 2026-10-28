@@ -9,7 +9,7 @@ from sqlalchemy import text
 from shared.db import get_engine
 from shared.schemas.events import EventType, RedisEvent
 
-from quant_service.indicators.registry import IndicatorBase, register
+from quant_service.indicators.registry import TIER_ALWAYS, IndicatorBase, register
 
 log = structlog.get_logger()
 
@@ -23,7 +23,7 @@ def set_db_url(url: str) -> None:
     _db_url = url
 
 
-@register([EventType.TICK])
+@register([EventType.TICK], tier=TIER_ALWAYS)
 class HistoricalAggregator(IndicatorBase):
     """Collect ticks and flush OHLCV candles to TimescaleDB periodically."""
 

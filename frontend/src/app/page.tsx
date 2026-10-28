@@ -14,16 +14,14 @@ const TradingDashboard = dynamic(
   { ssr: false },
 );
 
-const IS_MOCK = process.env.NEXT_PUBLIC_MOCK_MODE === "true";
-
 export default function Home() {
-  const { status, loading, isAuthenticated, refetch } = useAuthStatus();
+  const { status, loading, isAuthenticated, refetch, logout } = useAuthStatus();
   const setBrokerStatus = useMarketDataStore((s) => s.setBrokerStatus);
+  const sessionStatus = useMarketDataStore((s) => s.sessionStatus);
   const [showSettings, setShowSettings] = useState(false);
 
   // Sync broker status to store
   useEffect(() => {
-    if (IS_MOCK) return;
     if (loading) {
       setBrokerStatus("authenticating");
     } else if (isAuthenticated) {
@@ -34,28 +32,24 @@ export default function Home() {
   }, [loading, isAuthenticated, setBrokerStatus]);
 
   useEffect(() => {
-    if (IS_MOCK || (!loading && isAuthenticated)) {
+    if (!loading && isAuthenticated) {
       const orchestrator = new DataFeedOrchestrator();
       orchestrator.init();
       return () => orchestrator.destroy();
     }
   }, [loading, isAuthenticated]);
 
+  useEffect(() => {
+    if (sessionStatus === "expired") {
+      void refetch();
+    }
+  }, [refetch, sessionStatus]);
+
   // Settings page (accessible from any state)
   if (showSettings) {
     return <SettingsPanel onClose={() => setShowSettings(false)} />;
   }
 
-  // In mock mode, skip auth entirely
-  if (IS_MOCK) {
-    return (
-      <main className="h-screen w-screen overflow-hidden">
-        <TradingDashboard onOpenSettings={() => setShowSettings(true)} />
-      </main>
-    );
-  }
-
-  // Non-mock: wait for auth status check
   if (loading) {
     return (
       <div className="flex h-screen items-center justify-center bg-background text-muted-foreground">
@@ -64,14 +58,17 @@ export default function Home() {
     );
   }
 
-  // Non-mock: show login if not authenticated
   if (!isAuthenticated) {
     return <KotakLogin onAuthenticated={refetch} apiReachable={status !== null} onOpenSettings={() => setShowSettings(true)} />;
   }
 
   return (
     <main className="h-screen w-screen overflow-hidden">
-      <TradingDashboard onOpenSettings={() => setShowSettings(true)} />
+      <TradingDashboard
+        onOpenSettings={() => setShowSettings(true)}
+        onSwitchAccount={logout}
+        activeUcc={status?.ucc ?? ""}
+      />
     </main>
   );
 }

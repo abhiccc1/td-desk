@@ -10,18 +10,16 @@ interface GreeksState {
   netGamma: number;
   netTheta: number;
   netVega: number;
+  positionGreeks: Map<string, GreeksResult>;
+  positionGreeksVersion: number;
 }
 
 interface GreeksActions {
   updateGreeks: (greeks: GreeksResult) => void;
   updateGreeksBatch: (greeks: GreeksResult[]) => void;
   clearGreeks: () => void;
-  setNetGreeks: (
-    delta: number,
-    gamma: number,
-    theta: number,
-    vega: number,
-  ) => void;
+  updatePositionGreeksBatch: (greeks: GreeksResult[]) => void;
+  clearPositionGreeks: () => void;
 }
 
 export type GreeksStore = GreeksState & GreeksActions;
@@ -34,6 +32,8 @@ export const useGreeksStore = create<GreeksStore>()((set, get) => ({
   netGamma: 0,
   netTheta: 0,
   netVega: 0,
+  positionGreeks: new Map<string, GreeksResult>(),
+  positionGreeksVersion: 0,
 
   updateGreeks: (greeks: GreeksResult) => {
     get().updateGreeksBatch([greeks]);
@@ -62,17 +62,23 @@ export const useGreeksStore = create<GreeksStore>()((set, get) => ({
     }));
   },
 
-  setNetGreeks: (
-    delta: number,
-    gamma: number,
-    theta: number,
-    vega: number,
-  ) => {
-    set({
-      netDelta: delta,
-      netGamma: gamma,
-      netTheta: theta,
-      netVega: vega,
-    });
+  updatePositionGreeksBatch: (greeks: GreeksResult[]) => {
+    if (greeks.length === 0) return;
+    const map = new Map(get().positionGreeks);
+    for (const g of greeks) {
+      map.set(g.symbol, g);
+    }
+    set((state) => ({
+      positionGreeks: map,
+      positionGreeksVersion: state.positionGreeksVersion + 1,
+    }));
   },
+
+  clearPositionGreeks: () => {
+    set((state) => ({
+      positionGreeks: new Map<string, GreeksResult>(),
+      positionGreeksVersion: state.positionGreeksVersion + 1,
+    }));
+  },
+
 }));

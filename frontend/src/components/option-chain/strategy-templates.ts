@@ -263,7 +263,8 @@ function findStrikeIdxByDelta(
   let bestDist = Infinity;
   for (let i = 0; i < strikes.length; i++) {
     const strike = strikes[i].strike;
-    const strikeStr = Number.isInteger(strike) ? String(strike) : strike.toFixed(0);
+    // Backend cache symbols keep fractional strikes as-is (e.g. "292.5")
+    const strikeStr = String(strike);
     const symbol = `${underlying} ${expiryCompact} ${strikeStr} ${side}`;
     const g = greeksMap.get(symbol);
     if (!g) continue;
@@ -334,7 +335,8 @@ function findStrikeIdxBySviEdge(
     if (optionType === "CE" && strike <= spot) continue;
     if (optionType === "PE" && strike >= spot) continue;
 
-    const strikeStr = Number.isInteger(strike) ? String(strike) : strike.toFixed(0);
+    // Backend cache symbols keep fractional strikes as-is (e.g. "292.5")
+    const strikeStr = String(strike);
     const symbol = `${underlying} ${expiryCompact} ${strikeStr} ${sideLabel}`;
     const g = greeksMap.get(symbol);
     if (!g || g.iv <= 0) continue;

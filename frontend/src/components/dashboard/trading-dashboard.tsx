@@ -16,9 +16,11 @@ import { PanelVisibilityBar } from "./panel-visibility-bar";
 
 interface Props {
   onOpenSettings?: () => void;
+  onSwitchAccount?: () => void;
+  activeUcc?: string;
 }
 
-export default function TradingDashboard({ onOpenSettings }: Props) {
+export default function TradingDashboard({ onOpenSettings, onSwitchAccount, activeUcc }: Props) {
   useLiveData();
   const layout = useLayoutStore((s) => s.layout);
   const setLayout = useLayoutStore((s) => s.setLayout);
@@ -92,11 +94,27 @@ export default function TradingDashboard({ onOpenSettings }: Props) {
           font-weight: 700 !important;
           color: #facc15 !important;
         }
-        .cell-clickable {
-          cursor: pointer !important;
+        .option-chain-grid .ag-cell {
+          text-align: center !important;
         }
-        .cell-clickable:hover {
+        .option-chain-grid .ag-cell-wrapper,
+        .option-chain-grid .ag-cell-value,
+        .option-chain-grid .ag-right-aligned-cell .ag-cell-value {
+          justify-content: center !important;
+          text-align: center !important;
+          width: 100%;
+        }
+        .option-chain-grid .option-action-cell {
+          background: rgba(59, 130, 246, 0.05) !important;
+        }
+        .option-chain-grid .ag-row-hover .option-action-cell {
           background: rgba(59, 130, 246, 0.15) !important;
+        }
+        .option-chain-grid .ag-row-hover .option-action-value {
+          opacity: 0.18;
+        }
+        .option-chain-grid .ag-row-hover .option-action-buttons {
+          opacity: 1;
         }
         .cell-leg-sell {
           background: rgba(239, 68, 68, 0.15) !important;
@@ -108,7 +126,11 @@ export default function TradingDashboard({ onOpenSettings }: Props) {
           background: rgba(59, 130, 246, 0.08) !important;
         }
         .row-itm-call {
-          background: rgba(59, 130, 246, 0.04) !important;
+          background: rgba(59, 130, 246, 0.03) !important;
+        }
+        .row-has-position {
+          border-left: 3px solid rgba(250, 204, 21, 0.7) !important;
+          background: rgba(250, 204, 21, 0.08) !important;
         }
 
         /* Spot-price divider row */
@@ -289,7 +311,11 @@ export default function TradingDashboard({ onOpenSettings }: Props) {
         }
       `}</style>
       <div className="flex h-screen w-screen flex-col bg-panel">
-        <GlobalToolbar onOpenSettings={onOpenSettings} />
+        <GlobalToolbar
+          onOpenSettings={onOpenSettings}
+          onSwitchAccount={onSwitchAccount}
+          activeUcc={activeUcc}
+        />
         {showPanelBar && <PanelVisibilityBar />}
         <div className="min-h-0 flex-1">
           <Mosaic<PanelId>

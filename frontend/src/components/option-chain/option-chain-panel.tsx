@@ -1,19 +1,24 @@
 "use client";
 
-import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { startTransition, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Activity, TimerReset } from "lucide-react";
 import { useNow } from "@/hooks/use-now";
 import { useBasketStore } from "@/stores/basket-store";
 import { buildActiveLegSet } from "@/stores/basket-store";
 import { useMarketDataStore } from "@/stores/market-data-store";
-import { OptionChainGrid } from "./option-chain-grid";
+import {
+  type ColumnToggleKey,
+  loadVisibleColumns,
+  OptionChainColumnToggles,
+  OptionChainGrid,
+  saveVisibleColumns,
+} from "./option-chain-grid";
 import { InlineOrderDrawer } from "./inline-order-drawer";
-import { useCellClickHandler } from "./use-cell-click-handler";
 import { SviAlertBar } from "@/components/alerts/svi-alert-bar";
 
 const MIN_DRAWER_H = 80;
 const MIN_GRID_H = 100;
-const DEFAULT_DRAWER_H = 600;
+const DEFAULT_DRAWER_H = 400;
 const COLLAPSED_H = 32;
 
 function formatLatency(ms: number | null): string {
@@ -22,43 +27,50 @@ function formatLatency(ms: number | null): string {
   return `${(ms / 1000).toFixed(2)}s`;
 }
 
-function ChainLatencyReadout() {
+function ChainLatencyReadout({ children }: { children?: ReactNode }) {
   const now = useNow(250);
   const optionChain = useMarketDataStore((s) => s.optionChain);
+  const lastLiveSourceAtMs = useMarketDataStore((s) => s.lastLiveSourceAtMs);
 
-  if (!optionChain?.timestamp) return null;
-
-  const publishedAt = new Date(optionChain.timestamp).getTime();
-  const sourceAt = optionChain.sourceTimestamp
+  const publishedAt = optionChain?.timestamp
+    ? new Date(optionChain.timestamp).getTime()
+    : null;
+  const sourceAt = optionChain?.sourceTimestamp
     ? new Date(optionChain.sourceTimestamp).getTime()
     : null;
 
   const snapshotLagMs =
-    sourceAt !== null && Number.isFinite(sourceAt)
+    publishedAt !== null && sourceAt !== null && Number.isFinite(sourceAt)
       ? Math.max(0, publishedAt - sourceAt)
       : null;
-  const uiLagMs = Number.isFinite(publishedAt)
-    ? Math.max(0, now - publishedAt)
-    : null;
+  const uiLagMs =
+    publishedAt !== null && Number.isFinite(publishedAt)
+      ? Math.max(0, now - publishedAt)
+      : null;
   const liveAgeMs =
-    sourceAt !== null && Number.isFinite(sourceAt)
-      ? Math.max(0, now - sourceAt)
+    lastLiveSourceAtMs !== null && Number.isFinite(lastLiveSourceAtMs)
+      ? Math.max(0, now - lastLiveSourceAtMs)
       : null;
 
   return (
-    <div className="flex items-center justify-end gap-2 border-b border-[#2a2a4a] bg-[#16213e] px-3 py-1 text-[10px] text-[#9090a8]">
-      <span className="font-medium text-[#b7b7c8]">Latency</span>
-      <span className="inline-flex items-center gap-1 rounded-sm border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 tabular-nums text-emerald-300">
-        <Activity className="h-3 w-3" />
-        Live {formatLatency(liveAgeMs)}
-      </span>
-      <span className="inline-flex items-center gap-1 rounded-sm border border-blue-500/30 bg-blue-500/10 px-1.5 py-0.5 tabular-nums text-blue-300">
-        <TimerReset className="h-3 w-3" />
-        Snapshot {formatLatency(snapshotLagMs)}
-      </span>
-      <span className="rounded-sm border border-[#38415d] bg-[#20263d] px-1.5 py-0.5 tabular-nums text-[#c7cada]">
-        UI {formatLatency(uiLagMs)}
-      </span>
+    <div className="flex items-center justify-between gap-3 border-b border-[#2a2a4a] bg-[#16213e] px-3 py-1 text-[10px] text-[#9090a8]">
+      <div className="min-w-0 flex flex-wrap items-center gap-1">
+        {children}
+      </div>
+      <div className="flex flex-wrap items-center justify-end gap-2">
+        <span className="font-medium text-[#b7b7c8]">Latency</span>
+        <span className="inline-flex items-center gap-1 rounded-sm border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 tabular-nums text-emerald-300">
+          <Activity className="h-3 w-3" />
+          Live {formatLatency(liveAgeMs)}
+        </span>
+        <span className="inline-flex items-center gap-1 rounded-sm border border-blue-500/30 bg-blue-500/10 px-1.5 py-0.5 tabular-nums text-blue-300">
+          <TimerReset className="h-3 w-3" />
+          Snapshot {formatLatency(snapshotLagMs)}
+        </span>
+        <span className="rounded-sm border border-[#38415d] bg-[#20263d] px-1.5 py-0.5 tabular-nums text-[#c7cada]">
+          UI {formatLatency(uiLagMs)}
+        </span>
+      </div>
     </div>
   );
 }
@@ -66,7 +78,7 @@ function ChainLatencyReadout() {
 export function OptionChainPanel() {
   const legs = useBasketStore((s) => s.legs);
   const activeLegSet = useMemo(() => buildActiveLegSet(legs), [legs]);
-  const onCellClicked = useCellClickHandler();
+  const [visibleColumns, setVisibleColumns] = useState<Set<ColumnToggleKey>>(loadVisibleColumns);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const [drawerHeight, setDrawerHeight] = useState(COLLAPSED_H);
@@ -91,6 +103,16 @@ export function OptionChainPanel() {
 
   const toggleDrawer = useCallback(() => {
     setDrawerHeight((h) => (h <= COLLAPSED_H ? DEFAULT_DRAWER_H : COLLAPSED_H));
+  }, []);
+
+  const toggleColumn = useCallback((key: ColumnToggleKey) => {
+    setVisibleColumns((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      saveVisibleColumns(next);
+      return next;
+    });
   }, []);
 
   const onMouseDown = useCallback((e: React.MouseEvent) => {
@@ -126,11 +148,16 @@ export function OptionChainPanel() {
       className="flex h-full flex-col bg-panel text-panel-muted"
     >
       <SviAlertBar />
-      <ChainLatencyReadout />
+      <ChainLatencyReadout>
+        <OptionChainColumnToggles
+          visibleColumns={visibleColumns}
+          onToggleColumn={toggleColumn}
+        />
+      </ChainLatencyReadout>
       <div className="min-h-0 flex-1">
         <OptionChainGrid
-          onCellClicked={onCellClicked}
           activeLegSet={activeLegSet}
+          visibleColumns={visibleColumns}
         />
       </div>
 

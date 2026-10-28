@@ -12,7 +12,7 @@ import asyncio
 import orjson
 import structlog
 
-from shared.redis_client import subscribe
+from shared.redis_client import subscribe_raw
 
 from api_gateway.websockets.manager import ConnectionManager
 
@@ -22,12 +22,20 @@ log = structlog.get_logger()
 _CHANNEL_PATTERNS: list[str] = [
     "ticks:option:*",
     "ticks:chain:*",
+    "ticks:spot:*",
     "greeks:computed:*",
     "greeks:batch:*",
+    "greeks:position_batch:*",
     "model:prices:*",
-    "risk:exposure",
+    "model:analytics:*",
     "orders:updates:*",
+    "orders:events:*",
+    "strategy:result:*",
+    "risk:exposure",
     "svi:alerts:*",
+    "vrp:computed:*",
+    "calibration:completed:*",
+    "session:*",
 ]
 
 
@@ -37,22 +45,27 @@ async def start_fan_out(manager: ConnectionManager, redis_url: str) -> None:
     Messages are wrapped as {"topic": <channel>, "payload": <event_payload>}
     so the frontend WSClient can route them by topic.
     """
-    log.info("fan_out.starting", patterns=_CHANNEL_PATTERNS)
 
     while True:
         try:
-            # subscribe() yields (channel_name, RedisEvent) tuples
-            async for channel_name, event in subscribe(
+            # subscribe_raw() yields (channel_name, dict) — no Pydantic overhead
+            async for channel_name, event_dict in subscribe_raw(
                 redis_url, _CHANNEL_PATTERNS, pattern=True
             ):
-                # Use the full Redis channel name as the WS topic
-                # e.g. "ticks:chain:NIFTY:2026-03-19"
                 topic = channel_name
-
-                # Wrap in {topic, payload} so frontend can route by topic
+                # Most channels carry a dict ({"payload": ...} or a bare event
+                # dict), but some publish scalars — e.g. session:kotak:version_changed
+                # emits a bare int version. Forward non-dicts as-is instead of
+                # calling .get(), which would raise and tear down every
+                # subscription (including ticks:chain:*) in this loop.
+                payload = (
+                    event_dict.get("payload", event_dict)
+                    if isinstance(event_dict, dict)
+                    else event_dict
+                )
                 wrapped = orjson.dumps({
                     "topic": topic,
-                    "payload": event.payload,
+                    "payload": payload,
                 }).decode()
                 await manager.broadcast(topic, wrapped)
 

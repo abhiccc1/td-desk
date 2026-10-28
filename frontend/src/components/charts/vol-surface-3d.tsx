@@ -1,8 +1,7 @@
 "use client";
 
-import { useMemo } from "react";
+import { useRef, useMemo, useCallback } from "react";
 import createPlotlyComponent from "react-plotly.js/factory";
-// Use the minimal gl3d bundle — only includes 3D trace types (~800KB vs ~3.5MB full)
 import Plotly from "plotly.js-gl3d-dist-min";
 
 const Plot = createPlotlyComponent(Plotly);
@@ -22,16 +21,53 @@ interface Props {
   underlying: string;
 }
 
+const INITIAL_LAYOUT: Partial<Plotly.Layout> = {
+  autosize: true,
+  uirevision: "persist",
+  paper_bgcolor: "#1a1a2e",
+  plot_bgcolor: "#1a1a2e",
+  margin: { l: 0, r: 0, t: 0, b: 0, pad: 0 },
+  scene: {
+    xaxis: {
+      title: { text: "Strike", font: { color: "#808090", size: 10 } },
+      color: "#808090",
+      gridcolor: "rgba(255,255,255,0.06)",
+      backgroundcolor: "#1a1a2e",
+      tickfont: { size: 9, color: "#808090" },
+    },
+    yaxis: {
+      title: { text: "DTE", font: { color: "#808090", size: 10 } },
+      color: "#808090",
+      gridcolor: "rgba(255,255,255,0.06)",
+      backgroundcolor: "#1a1a2e",
+      tickfont: { size: 9, color: "#808090" },
+    },
+    zaxis: {
+      title: { text: "IV %", font: { color: "#808090", size: 10 } },
+      color: "#808090",
+      gridcolor: "rgba(255,255,255,0.06)",
+      backgroundcolor: "#1a1a2e",
+      tickfont: { size: 9, color: "#808090" },
+    },
+    camera: {
+      eye: { x: 1.6, y: -1.8, z: 0.9 },
+      center: { x: 0, y: 0, z: -0.15 },
+    },
+    aspectratio: { x: 1.2, y: 1, z: 0.6 },
+  },
+};
+
 export function VolSurface3D({ grid, spot, underlying }: Props) {
   void spot;
   void underlying;
-  const { data, layout } = useMemo(() => {
-    const { strikes, dtes, ivs, minIv, maxIv } = grid;
 
-    // Replace nulls with NaN so Plotly renders gaps instead of zeros
+  const plotRef = useRef<{ el: HTMLElement } | null>(null);
+
+  const data = useMemo<Plotly.Data[]>(() => {
+    const { strikes, dtes, ivs, minIv, maxIv } = grid;
     const zData = ivs.map((row) => row.map((v) => (v === null ? NaN : v)));
 
-    const surfaceData: Plotly.Data[] = [
+    return [
       {
         type: "surface" as const,
         x: strikes,
@@ -72,54 +108,36 @@ export function VolSurface3D({ grid, spot, underlying }: Props) {
         },
       } as Plotly.Data,
     ];
+  }, [grid]);
 
-    const surfaceLayout: Partial<Plotly.Layout> = {
-      autosize: true,
-      paper_bgcolor: "#1a1a2e",
-      plot_bgcolor: "#1a1a2e",
-      margin: { l: 0, r: 0, t: 0, b: 0, pad: 0 },
-      scene: {
-        xaxis: {
-          title: { text: "Strike", font: { color: "#808090", size: 10 } },
-          color: "#808090",
-          gridcolor: "rgba(255,255,255,0.06)",
-          backgroundcolor: "#1a1a2e",
-          tickfont: { size: 9, color: "#808090" },
-        },
-        yaxis: {
-          title: { text: "DTE", font: { color: "#808090", size: 10 } },
-          color: "#808090",
-          gridcolor: "rgba(255,255,255,0.06)",
-          backgroundcolor: "#1a1a2e",
-          tickfont: { size: 9, color: "#808090" },
-        },
-        zaxis: {
-          title: { text: "IV %", font: { color: "#808090", size: 10 } },
-          color: "#808090",
-          gridcolor: "rgba(255,255,255,0.06)",
-          backgroundcolor: "#1a1a2e",
-          tickfont: { size: 9, color: "#808090" },
-        },
-        camera: {
-          eye: { x: 1.6, y: -1.8, z: 0.9 },
-          center: { x: 0, y: 0, z: -0.15 },
-        },
-        aspectratio: { x: 1.2, y: 1, z: 0.6 },
-      },
-    };
+  // Use Plotly.react directly for data updates — this preserves camera state
+  // because we only update data traces, not the layout.
+  const onInitialized = useCallback((_: unknown, graphDiv: HTMLElement) => {
+    plotRef.current = { el: graphDiv };
+  }, []);
 
-    return { data: surfaceData, layout: surfaceLayout };
+  const onUpdate = useCallback((_: unknown, graphDiv: HTMLElement) => {
+    plotRef.current = { el: graphDiv };
+  }, []);
+
+  // revision counter forces Plotly to call react() instead of newPlot()
+  const revision = useMemo(() => {
+    return grid.strikes.length + grid.expiries.length;
   }, [grid]);
 
   return (
     <Plot
       data={data}
-      layout={layout}
+      layout={INITIAL_LAYOUT}
+      revision={revision}
+      onInitialized={onInitialized}
+      onUpdate={onUpdate}
       config={{
         displayModeBar: true,
         displaylogo: false,
         modeBarButtonsToRemove: ["toImage", "sendDataToCloud"],
         responsive: true,
+        scrollZoom: true,
       }}
       useResizeHandler
       style={{ width: "100%", height: "100%" }}

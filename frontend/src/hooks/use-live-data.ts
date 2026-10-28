@@ -8,6 +8,7 @@
 import { useEffect } from "react";
 
 import {
+  fetchAllExpiries,
   fetchExpiries,
   fetchGreeks,
   fetchModelPrices,
@@ -22,28 +23,55 @@ export function useLiveData() {
   const underlying = useMarketDataStore((s) => s.selectedUnderlying);
   const expiry = useMarketDataStore((s) => s.selectedExpiry);
   const feedMode = useMarketDataStore((s) => s.feedMode);
+  const expiriesByUnderlying = useMarketDataStore((s) => s.expiriesByUnderlying);
 
-  // Fetch available expiries when underlying changes
+  // Load all expiries once per app session from Redis-backed cache.
   useEffect(() => {
-    if (!underlying) return;
-    if (feedMode === "mock") return;
+    if (feedMode !== "broker") return;
 
     let cancelled = false;
 
-    fetchExpiries(underlying)
-      .then((expiries) => {
+    fetchAllExpiries()
+      .then(({ lastUpdated, expiriesByUnderlying }) => {
         if (!cancelled) {
-          useMarketDataStore.getState().setAvailableExpiries(expiries);
-          // Auto-select nearest expiry when underlying changes
-          if (expiries.length > 0) {
-            const current = useMarketDataStore.getState().selectedExpiry;
-            if (!current || !expiries.includes(current)) {
-              useMarketDataStore.getState().setSelectedExpiry(expiries[0]);
-            }
-          }
+          useMarketDataStore.getState().setExpiriesCache(expiriesByUnderlying, lastUpdated);
         }
       })
       .catch(() => {});
+
+    return () => {
+      cancelled = true;
+    };
+  }, [feedMode]);
+
+  // Update selected underlying's expiry list from the loaded cache.
+  useEffect(() => {
+    if (!underlying || feedMode !== "broker") return;
+
+    let cancelled = false;
+
+    const cachedExpiries = expiriesByUnderlying[underlying];
+    if (cachedExpiries && cachedExpiries.length > 0) {
+      useMarketDataStore.getState().setAvailableExpiries(cachedExpiries);
+      const current = useMarketDataStore.getState().selectedExpiry;
+      if (!current || !cachedExpiries.includes(current)) {
+        useMarketDataStore.getState().setSelectedExpiry(cachedExpiries[0]);
+      }
+    } else {
+      fetchExpiries(underlying)
+        .then((expiries) => {
+          if (!cancelled) {
+            useMarketDataStore.getState().setAvailableExpiries(expiries);
+            if (expiries.length > 0) {
+              const current = useMarketDataStore.getState().selectedExpiry;
+              if (!current || !expiries.includes(current)) {
+                useMarketDataStore.getState().setSelectedExpiry(expiries[0]);
+              }
+            }
+          }
+        })
+        .catch(() => {});
+    }
 
     // Fetch static OHLC data for the underlying index
     fetchStaticData(underlying)
@@ -57,13 +85,11 @@ export function useLiveData() {
     return () => {
       cancelled = true;
     };
-  }, [underlying, feedMode]);
+  }, [underlying, feedMode, expiriesByUnderlying]);
 
   // Fetch option chain + greeks + SVI when underlying/expiry changes
   useEffect(() => {
-    if (!underlying || !expiry) return;
-    // Skip REST fetches in mock mode — mock ticker handles everything
-    if (feedMode === "mock") return;
+    if (!underlying || !expiry || feedMode !== "broker") return;
 
     let cancelled = false;
 

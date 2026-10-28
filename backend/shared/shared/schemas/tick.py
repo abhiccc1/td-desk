@@ -39,3 +39,13 @@ class OptionChainSnapshot(BaseModel):
     strikes: list[OptionStrike]
     timestamp: datetime
     source_timestamp: datetime | None = None
+    # Options-on-futures only: the future this expiry devolves into
+    # ({"symbol", "tradingSymbol", "token", "expiry"}); underlying_price is its LTP.
+    underlying_future: dict[str, str] | None = None
+    # Analytics tiers the connected clients actually asked for, as the union of
+    # their demand claims. quant_service runs only the indicators a listed tier
+    # covers, so a client that renders nothing but quotes (the mobile app) costs
+    # no IV solve, SVI fit, Heston/VG calibration or FFT pricing at all. None
+    # means no client has stated a need, and every tier runs — failing toward
+    # the full pipeline rather than silently starving a panel of its data.
+    analytics: list[str] | None = None

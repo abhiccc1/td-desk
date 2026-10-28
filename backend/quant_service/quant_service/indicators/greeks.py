@@ -5,24 +5,24 @@ Uses td_core (Rust/PyO3) for BSM computation via batch_compute_greeks_warm
 """
 
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 
 import math
+import time
 
 import structlog
 import td_core
 
+from shared.instruments import pricing_model, time_to_expiry_years
 from shared.redis_client import cache_set, cache_hset
 from shared.schemas.events import EventType, RedisEvent
 from shared.schemas.greeks import GreeksResult, SviParams
 
 from quant_service.config import QuantSettings
-from quant_service.indicators.registry import IndicatorBase, register
+from quant_service.indicators.registry import TIER_GREEKS, IndicatorBase, register
 
 log = structlog.get_logger()
 
 _RISK_FREE_RATE: float = 0.065
-_IST = ZoneInfo("Asia/Kolkata")
 _settings: QuantSettings | None = None
 
 
@@ -101,15 +101,46 @@ def _detect_svi_alerts(
     return alerts
 
 
-@register([EventType.CHAIN_SNAPSHOT])
+# Longest a chain may go without a Greeks recompute when no quote has moved.
+# Theta and the time-to-expiry term keep drifting even on a frozen chain, so
+# an unchanged fingerprint still re-solves at this cadence.
+_GREEKS_MAX_STALENESS_S = 5.0
+
+
+@register([EventType.CHAIN_SNAPSHOT, EventType.POSITION_CHAIN_SNAPSHOT], tier=TIER_GREEKS)
 class ChainGreeksCalculator(IndicatorBase):
     """Batch-compute IV and Greeks for an entire option chain snapshot.
 
     Uses td_core.batch_compute_greeks_warm for warm-started IV solving
     with rayon parallelism over the full strike strip.
+
+    Snapshots arriving faster than the quotes inside them change are skipped:
+    re-solving IV for an identical strip yields identical Greeks. This is a
+    backstop independent of the UI's demand signal — if demand is mis-reported
+    or never arrives, an idle chain still costs close to nothing.
     """
 
+    def __init__(self) -> None:
+        # (underlying, expiry, is_position) -> (fingerprint, monotonic time)
+        self._last_compute: dict[tuple[str, str, bool], tuple[int, float]] = {}
+
+    def _should_recompute(
+        self, key: tuple[str, str, bool], fingerprint: int
+    ) -> bool:
+        previous = self._last_compute.get(key)
+        now_mono = time.monotonic()
+        if (
+            previous is not None
+            and previous[0] == fingerprint
+            and now_mono - previous[1] < _GREEKS_MAX_STALENESS_S
+        ):
+            return False
+        self._last_compute[key] = (fingerprint, now_mono)
+        return True
+
     async def compute(self, event: RedisEvent) -> list[RedisEvent]:
+        is_position_snapshot = event.event_type == EventType.POSITION_CHAIN_SNAPSHOT
+
         payload = event.payload
         strikes_data: list[dict] = payload.get("strikes", [])
         underlying: str = payload.get("underlying", "")
@@ -121,11 +152,11 @@ class ChainGreeksCalculator(IndicatorBase):
             return []
 
         now = datetime.now(timezone.utc)
-        expiry_dt = datetime.strptime(expiry, "%Y-%m-%d").replace(
-            hour=15, minute=30, tzinfo=_IST,
-        ).astimezone(timezone.utc)
-        t = max((expiry_dt - now).total_seconds() / (365.25 * 86400), 1e-6)
+        t = time_to_expiry_years(underlying, expiry, now)
         r = _RISK_FREE_RATE
+        # Options on futures (MCX) are Black-76 on the future's price; the
+        # snapshot's underlyingPrice is that future's LTP for this expiry.
+        is_black76 = pricing_model(underlying) == "black76"
 
         # Build sorted SoA arrays from the chain snapshot.
         # Each strike in the snapshot may have call and/or put data.
@@ -161,7 +192,29 @@ class ChainGreeksCalculator(IndicatorBase):
             log.warning("greeks.no_valid_strikes", underlying=underlying, total_entries=len(strikes_data))
             return []
 
-        log.info("greeks.pre_compute", underlying=underlying, valid_strikes=len(sorted_strikes), spot=underlying_price, t=round(t, 6))
+        # debug, not info: fires at the chain's emit cadence.
+        log.debug("greeks.pre_compute", underlying=underlying, valid_strikes=len(sorted_strikes), spot=underlying_price, t=round(t, 6))
+
+        # Skip chains whose quotes haven't moved since the last solve. Built
+        # from the same inputs the Rust batch consumes, so an identical
+        # fingerprint guarantees identical Greeks (modulo the time decay the
+        # staleness bound covers).
+        fingerprint = hash((
+            round(underlying_price, 4),
+            tuple(sorted_strikes),
+            tuple(round(p, 4) for p in sorted_prices),
+            tuple(sorted_is_calls),
+        ))
+        if not self._should_recompute(
+            (underlying, expiry, is_position_snapshot), fingerprint
+        ):
+            log.debug(
+                "greeks.chain_unchanged",
+                underlying=underlying,
+                expiry=expiry,
+                position=is_position_snapshot,
+            )
+            return []
 
         # Sort by strike for warm-start sweep
         indices = sorted(range(len(sorted_strikes)), key=lambda i: sorted_strikes[i])
@@ -172,7 +225,11 @@ class ChainGreeksCalculator(IndicatorBase):
         sorted_option_types = [sorted_option_types[i] for i in indices]
 
         # Call Rust warm-start batch
-        results = td_core.batch_compute_greeks_warm(
+        batch = (
+            td_core.batch_compute_greeks_warm_black76 if is_black76
+            else td_core.batch_compute_greeks_warm
+        )
+        results = batch(
             underlying_price, r, t,
             sorted_strikes, sorted_prices, sorted_is_calls,
         )
@@ -183,7 +240,7 @@ class ChainGreeksCalculator(IndicatorBase):
         for i, result in enumerate(results):
             if result is None:
                 continue
-            iv, delta, gamma, theta, vega, _price = result
+            iv, delta, gamma, theta, vega, vanna, charm, vomma, _price = result
             computed += 1
 
             greeks_result = GreeksResult(
@@ -197,14 +254,23 @@ class ChainGreeksCalculator(IndicatorBase):
                 gamma=gamma,
                 theta=theta,
                 vega=vega,
+                vanna=vanna,
+                charm=charm,
+                vomma=vomma,
                 underlying_price=underlying_price,
                 timestamp=now,
             )
             greeks_batch.append(greeks_result.model_dump(mode="json", by_alias=True))
 
+        output_event_type = (
+            EventType.POSITION_GREEKS_BATCH_COMPUTED
+            if is_position_snapshot
+            else EventType.GREEKS_BATCH_COMPUTED
+        )
+
         if greeks_batch:
             events.append(RedisEvent(
-                event_type=EventType.GREEKS_BATCH_COMPUTED,
+                event_type=output_event_type,
                 source_service="quant_service",
                 payload={
                     "underlying": underlying,
@@ -212,6 +278,33 @@ class ChainGreeksCalculator(IndicatorBase):
                     "greeks": greeks_batch,
                 },
             ))
+
+        # ── For position snapshots, skip SVI fitting and heavy analytics ──
+        if is_position_snapshot:
+            # Cache position Greeks to a separate hash key
+            if computed > 0:
+                import json as _json
+                greeks_mapping = {}
+                for g in greeks_batch:
+                    sym = g.get("symbol", "")
+                    if sym:
+                        greeks_mapping[sym] = _json.dumps(g)
+                if greeks_mapping:
+                    await cache_hset(
+                        _get_settings().redis_url,
+                        f"cache:position_greeks:{underlying}:{expiry}",
+                        greeks_mapping,
+                        ttl=300,
+                    )
+
+            log.info(
+                "greeks.position_chain_computed",
+                underlying=underlying,
+                expiry=expiry,
+                total=len(sorted_strikes),
+                computed=computed,
+            )
+            return events
 
         # ── Fit SVI surface to the solved IVs ────────────────────────────
         solved_ivs: list[float] = []
@@ -226,8 +319,18 @@ class ChainGreeksCalculator(IndicatorBase):
                 solved_ks.append(k)
                 solved_ivs.append(iv_val)
 
+        weights: list[float] | None = None
+        if len(solved_ivs) >= 5:
+            solved_ks, solved_ivs, weights = td_core.filter_ivs_and_weight(
+                solved_ks,
+                solved_ivs,
+                0.15,
+                3.0,
+                0.05,
+            )
+
         if len(solved_ks) >= 5:
-            svi_params = td_core.svi_fit(solved_ks, solved_ivs, t)
+            svi_params = td_core.svi_fit(solved_ks, solved_ivs, t, weights)
             if svi_params is not None:
                 is_arb_free = td_core.svi_check_arbitrage(
                     svi_params,
@@ -236,11 +339,7 @@ class ChainGreeksCalculator(IndicatorBase):
                 )
 
                 # Compute RMSE
-                mse_sum = 0.0
-                for k_val, iv_val in zip(solved_ks, solved_ivs):
-                    fitted = td_core.svi_iv(svi_params, k_val, t)
-                    mse_sum += (fitted - iv_val) ** 2
-                rmse = (mse_sum / len(solved_ks)) ** 0.5
+                rmse = td_core.svi_rmse(svi_params, solved_ks, solved_ivs, t)
 
                 svi_result = SviParams(
                     underlying=underlying,

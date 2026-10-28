@@ -14,8 +14,6 @@ The td-desk platform computes a full SVI (Stochastic Volatility Inspired) volati
 | Option chain IV column | ✅ Market IV primary, SVI IV in dedicated column | Always shown side-by-side |
 | Option chain Edge column | ✅ IV Diff (Market - SVI) with color coding | Mispricing signal per strike |
 | Strategy analyzer | ⚠️ SVI used only for missing premium gap-fill | Rare trigger |
-| IV skew visualization | ❌ Not implemented | — |
-| Vol surface heatmap | ❌ Not implemented | — |
 
 ## Proposed Features
 

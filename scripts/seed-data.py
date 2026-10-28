@@ -3,7 +3,6 @@
 import asyncio
 import os
 from datetime import datetime, timedelta, timezone
-from uuid import uuid4
 
 import asyncpg
 
@@ -42,22 +41,6 @@ async def seed():
         tick_rows,
     )
     print(f"Inserted {len(tick_rows)} tick rows")
-
-    # Insert sample greeks
-    greeks_rows = []
-    for symbol, strike, opt_type in symbols:
-        greeks_rows.append((
-            now, symbol, "NIFTY", datetime(2026, 3, 25).date(), strike, opt_type,
-            0.18, 0.5 if opt_type == "C" else -0.5,
-            0.002, -5.5, 12.0, underlying_price,
-        ))
-
-    await conn.executemany(
-        """INSERT INTO greeks (time, symbol, underlying, expiry, strike, option_type, iv, delta, gamma, theta, vega, underlying_price)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)""",
-        greeks_rows,
-    )
-    print(f"Inserted {len(greeks_rows)} greeks rows")
 
     await conn.close()
     print("Seed complete.")

@@ -1,6 +1,7 @@
 "use client";
 
 import { useMemo } from "react";
+import { timeToExpiryYears } from "@/lib/instruments";
 import { ParentSize } from "@visx/responsive";
 import { scaleLinear } from "@visx/scale";
 import { LinePath, Circle } from "@visx/shape";
@@ -19,6 +20,18 @@ interface Point {
 interface MarketPoint extends Point {
   isCall: boolean;
 }
+
+/* ── Color palette ─────────────────────────────────────────────── */
+const COLORS = {
+  sviFit: "#60a5fa",     // blue-400 — reference curve
+  heston: "#f97316",     // orange-500 — bright on dark bg
+  vg: "#a78bfa",         // violet-400 — distinct from blue & orange
+  callIv: "#34d399",     // emerald-400 — scatter calls
+  putIv: "#fb7185",      // rose-400 — scatter puts
+  spot: "#fbbf24",       // amber-400 — spot line
+  calGood: "#22c55e",    // green-500 — calibrated
+  calBad: "#ef4444",     // red-500 — uncalibrated
+} as const;
 
 const MARGIN = { top: 20, right: 20, bottom: 40, left: 50 };
 
@@ -75,11 +88,12 @@ function IvSkewInner({ width, height }: { width: number; height: number }) {
     const sp = chain.underlyingPrice;
     if (sp <= 0) return empty;
 
-    const referenceMs = chain.timestamp
-      ? new Date(chain.timestamp).getTime()
-      : new Date(chain.expiry).getTime();
-    const expiryMs = new Date(chain.expiry).getTime() - referenceMs;
-    const t = Math.max(expiryMs / (365.25 * 86400_000), 1e-6);
+    // Same expiry close as the quant service's SVI fit (15:30 IST / MCX evening)
+    const t = timeToExpiryYears(
+      chain.underlying,
+      chain.expiry,
+      chain.timestamp ? new Date(chain.timestamp) : new Date(),
+    );
 
     // Collect market IVs from greeks store
     const dots: MarketPoint[] = [];
@@ -155,6 +169,24 @@ function IvSkewInner({ width, height }: { width: number; height: number }) {
 
   return (
     <svg width={width} height={height}>
+      {/* Glow filters for model curves (subtle outer glow for readability) */}
+      <defs>
+        <filter id="glow-svi" x="-10%" y="-10%" width="120%" height="120%">
+          <feGaussianBlur in="SourceGraphic" stdDeviation="1.5" result="blur" />
+          <feMerge>
+            <feMergeNode in="blur" />
+            <feMergeNode in="SourceGraphic" />
+          </feMerge>
+        </filter>
+        <filter id="glow-model" x="-10%" y="-10%" width="120%" height="120%">
+          <feGaussianBlur in="SourceGraphic" stdDeviation="1" result="blur" />
+          <feMerge>
+            <feMergeNode in="blur" />
+            <feMergeNode in="SourceGraphic" />
+          </feMerge>
+        </filter>
+      </defs>
+
       <Group left={MARGIN.left} top={MARGIN.top}>
         {/* Grid lines */}
         {yScale.ticks(5).map((tick) => (
@@ -168,57 +200,62 @@ function IvSkewInner({ width, height }: { width: number; height: number }) {
           />
         ))}
 
-        {/* Spot price vertical line */}
+        {/* Spot price vertical line — amber, thin dashed */}
         {spot > 0 && spot >= xDomain[0] && spot <= xDomain[1] && (
           <line
             x1={xScale(spot)}
             x2={xScale(spot)}
             y1={0}
             y2={innerHeight}
-            stroke="rgba(250,204,21,0.3)"
+            stroke={COLORS.spot}
+            strokeOpacity={0.4}
+            strokeWidth={1}
             strokeDasharray="4,4"
           />
         )}
 
-        {/* SVI fitted curve */}
+        {/* SVI fitted curve — blue, solid (reference) */}
         {sviCurve.length > 1 && (
           <LinePath
             data={sviCurve}
             x={(d) => xScale(d.x)}
             y={(d) => yScale(d.y)}
-            stroke="#3b82f6"
-            strokeWidth={2}
-            strokeOpacity={0.9}
+            stroke={COLORS.sviFit}
+            strokeWidth={2.5}
+            strokeOpacity={0.95}
+            filter="url(#glow-svi)"
           />
         )}
 
-        {/* Heston model IV curve */}
+        {/* Heston model IV curve — orange, long dash [10,5] */}
         {hestonCurve.length > 1 && (
           <LinePath
             data={hestonCurve}
             x={(d) => xScale(d.x)}
             y={(d) => yScale(d.y)}
-            stroke="#f97316"
-            strokeWidth={1.5}
-            strokeOpacity={0.85}
-            strokeDasharray="6,3"
+            stroke={COLORS.heston}
+            strokeWidth={2}
+            strokeOpacity={0.95}
+            strokeDasharray="10,5"
+            filter="url(#glow-model)"
           />
         )}
 
-        {/* VG model IV curve */}
+        {/* VG model IV curve — violet, dash-dot [8,4,2,4] */}
         {vgCurve.length > 1 && (
           <LinePath
             data={vgCurve}
             x={(d) => xScale(d.x)}
             y={(d) => yScale(d.y)}
-            stroke="#22d3ee"
-            strokeWidth={1.5}
-            strokeOpacity={0.85}
-            strokeDasharray="2,3"
+            stroke={COLORS.vg}
+            strokeWidth={2}
+            strokeOpacity={0.95}
+            strokeDasharray="8,4,2,4"
+            filter="url(#glow-model)"
           />
         )}
 
-        {/* Market IV scatter — calls */}
+        {/* Market IV scatter — calls (emerald circles) */}
         {marketDots
           .filter((d) => d.isCall)
           .map((d, i) => (
@@ -226,25 +263,30 @@ function IvSkewInner({ width, height }: { width: number; height: number }) {
               key={`c${i}`}
               cx={xScale(d.x)}
               cy={yScale(d.y)}
-              r={2.5}
-              fill="#60a5fa"
-              fillOpacity={0.7}
+              r={3}
+              fill={COLORS.callIv}
+              fillOpacity={0.8}
             />
           ))}
 
-        {/* Market IV scatter — puts */}
+        {/* Market IV scatter — puts (rose triangles via polygon) */}
         {marketDots
           .filter((d) => !d.isCall)
-          .map((d, i) => (
-            <Circle
-              key={`p${i}`}
-              cx={xScale(d.x)}
-              cy={yScale(d.y)}
-              r={2.5}
-              fill="#a78bfa"
-              fillOpacity={0.7}
-            />
-          ))}
+          .map((d, i) => {
+            const cx = xScale(d.x);
+            const cy = yScale(d.y);
+            const r = 3.5;
+            // Downward-pointing triangle
+            const points = `${cx},${cy + r} ${cx - r},${cy - r * 0.6} ${cx + r},${cy - r * 0.6}`;
+            return (
+              <polygon
+                key={`p${i}`}
+                points={points}
+                fill={COLORS.putIv}
+                fillOpacity={0.8}
+              />
+            );
+          })}
 
         {/* Axes */}
         <AxisBottom
@@ -287,24 +329,47 @@ function IvSkewInner({ width, height }: { width: number; height: number }) {
 
       {/* Legend */}
       <Group left={MARGIN.left + 8} top={MARGIN.top + 8}>
-        <line x1={0} x2={16} y1={0} y2={0} stroke="#3b82f6" strokeWidth={2} />
-        <text x={20} y={4} fill="#808090" fontSize={10}>
+        {/* SVI Fit — solid blue line */}
+        <line x1={0} x2={16} y1={0} y2={0} stroke={COLORS.sviFit} strokeWidth={2.5} />
+        <text x={20} y={4} fill={COLORS.sviFit} fontSize={10}>
           SVI Fit
         </text>
-        <line x1={0} x2={16} y1={14} y2={14} stroke="#f97316" strokeWidth={1.5} strokeDasharray="6,3" />
-        <text x={20} y={18} fill="#808090" fontSize={10}>
-          Heston
+
+        {/* Heston — dashed orange line + calibration status */}
+        <line x1={0} x2={16} y1={14} y2={14} stroke={COLORS.heston} strokeWidth={2} strokeDasharray="10,5" />
+        <text x={20} y={18} fill={COLORS.heston} fontSize={10}>
+          {"Heston "}
+          {modelPrices?.hestonCalibrated ? (
+            <tspan fill={COLORS.calGood}>
+              (cal{modelPrices.hestonRmse != null ? `, RMSE: ${(modelPrices.hestonRmse * 100).toFixed(1)}%` : ""})
+            </tspan>
+          ) : (
+            <tspan fill={COLORS.calBad}>(uncal)</tspan>
+          )}
         </text>
-        <line x1={0} x2={16} y1={28} y2={28} stroke="#22d3ee" strokeWidth={1.5} strokeDasharray="2,3" />
-        <text x={20} y={32} fill="#808090" fontSize={10}>
-          VG
+
+        {/* VG — dash-dot violet line + calibration status */}
+        <line x1={0} x2={16} y1={28} y2={28} stroke={COLORS.vg} strokeWidth={2} strokeDasharray="8,4,2,4" />
+        <text x={20} y={32} fill={COLORS.vg} fontSize={10}>
+          {"VG "}
+          {modelPrices?.vgCalibrated ? (
+            <tspan fill={COLORS.calGood}>
+              (cal{modelPrices.vgRmse != null ? `, RMSE: ${(modelPrices.vgRmse * 100).toFixed(1)}%` : ""})
+            </tspan>
+          ) : (
+            <tspan fill={COLORS.calBad}>(uncal)</tspan>
+          )}
         </text>
-        <Circle cx={4} cy={42} r={3} fill="#60a5fa" />
-        <text x={20} y={46} fill="#808090" fontSize={10}>
+
+        {/* Call IV — emerald circle */}
+        <Circle cx={4} cy={42} r={3} fill={COLORS.callIv} fillOpacity={0.8} />
+        <text x={20} y={46} fill={COLORS.callIv} fontSize={10}>
           Call IV
         </text>
-        <Circle cx={4} cy={56} r={3} fill="#a78bfa" />
-        <text x={20} y={60} fill="#808090" fontSize={10}>
+
+        {/* Put IV — rose triangle */}
+        <polygon points="4,53 1,58 7,58" fill={COLORS.putIv} fillOpacity={0.8} />
+        <text x={20} y={60} fill={COLORS.putIv} fontSize={10}>
           Put IV
         </text>
       </Group>

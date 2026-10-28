@@ -7,8 +7,10 @@ in Redis for the frontend to query.
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
+import json
 import re
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -16,7 +18,13 @@ from datetime import datetime, timezone
 import httpx
 import structlog
 
-from shared.instruments import InstrumentMaster, get_instrument_master
+from shared.instruments import (
+    IST,
+    REDIS_KEY_CONTRACT_META,
+    REDIS_KEY_UNDERLYING_FUTURE,
+    InstrumentMaster,
+    get_instrument_master,
+)
 from shared.redis_client import get_redis
 from shared.schemas.auth import BrokerCredentials
 
@@ -46,6 +54,14 @@ class ScripMasterResult:
         self.scrip_tokens: dict[str, dict[str, dict[str, str]]] = defaultdict(lambda: defaultdict(dict))
         # pTrdSymbol -> numeric pSymbol token (flat reverse lookup)
         self.trdsym_to_token: dict[str, str] = {}
+        # token -> exchange segment ("nse_fo", "mcx_fo", …) for tick labelling
+        self.token_segment: dict[str, str] = {}
+        # Futures-underlying (MCX) only:
+        # underlying -> {option expiry -> {"token", "tradingSymbol", "expiry", "symbol"}}
+        # where "symbol" is the tick symbol of the future the options devolve into
+        self.underlying_future: dict[str, dict[str, dict[str, str]]] = defaultdict(dict)
+        # underlying -> {option expiry -> {"lotSize", "pnlMultiplier", "maxOrderQty", "tickSize"}}
+        self.contract_meta: dict[str, dict[str, dict[str, float | int]]] = defaultdict(dict)
 
 
 async def fetch_and_parse_scrip_master(
@@ -101,7 +117,11 @@ async def fetch_and_parse_scrip_master(
             logger.info("scrip_master.downloading_segment", segment=seg, url=seg_url)
             csv_text = await _download_csv(client, seg_url)
             if csv_text:
-                _parse_csv(csv_text, result, im)
+                # CPU-bound row-by-row parse — keep it off the event loop so
+                # tick publishing/watchers don't stall during (re)activation
+                await asyncio.get_running_loop().run_in_executor(
+                    None, _parse_csv, csv_text, result, im
+                )
 
     # Step 3: Cache expiries and trading symbols in Redis
     await _cache_scrip_data(redis_url, result)
@@ -172,11 +192,18 @@ async def _download_csv(client: httpx.AsyncClient, url: str) -> str | None:
         return None
 
 
+def _today_ist() -> str:
+    return datetime.now(IST).strftime("%Y-%m-%d")
+
+
 def _parse_csv(csv_text: str, result: ScripMasterResult, im: InstrumentMaster) -> None:
     """Parse a segment's scrip master CSV and populate result."""
     reader = csv.DictReader(io.StringIO(csv_text))
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today_str = _today_ist()
     tracked = im.tracked_names()
+    # Futures-underlying rows (MCX) need all FUTCOM rows before options can be
+    # validated, so they are collected and parsed in a second step.
+    future_rows: list[dict[str, str]] = []
 
     for row in reader:
         underlying = row.get("pSymbolName", "").strip().upper()
@@ -185,6 +212,10 @@ def _parse_csv(csv_text: str, result: ScripMasterResult, im: InstrumentMaster) -
 
         cfg = im.get(underlying)
         if cfg is None:
+            continue
+
+        if cfg.underlying_source == "future":
+            future_rows.append({k.strip(): (v or "").strip() for k, v in row.items() if k})
             continue
 
         inst_type = row.get("pInstType", "").strip()
@@ -230,6 +261,7 @@ def _parse_csv(csv_text: str, result: ScripMasterResult, im: InstrumentMaster) -
         # Build subscription token using the underlying's segment prefix
         sub_token = f"{cfg.segment}|{token}"
         result.tokens[underlying][expiry_str].append(sub_token)
+        result.token_segment[token] = cfg.segment
 
         # Build symbol name for tick parsing: "NIFTY 260319 22000 CE"
         expiry_compact = expiry_str.replace("-", "")[2:]  # "260319" from "2026-03-19"
@@ -240,6 +272,9 @@ def _parse_csv(csv_text: str, result: ScripMasterResult, im: InstrumentMaster) -
             strike_int = 0
         symbol_name = f"{underlying} {expiry_compact} {strike_int} {option_type}"
         result.token_to_symbol[token] = symbol_name
+
+    if future_rows:
+        _parse_futures_underlying_rows(future_rows, result, im, today_str)
 
     # Sort expiries per underlying and keep all for caching (dropdown needs them)
     for underlying in list(result.tokens.keys()):
@@ -282,8 +317,218 @@ def _parse_expiry_from_ref(ref_key: str, underlying: str) -> str | None:
 
 
 
+def _epoch_to_date(raw: str) -> str | None:
+    """Plain Unix epoch → ``YYYY-MM-DD`` (UTC). MCX epochs carry no offset."""
+    try:
+        epoch = int(float(raw))
+    except (TypeError, ValueError):
+        return None
+    if epoch <= 0:
+        return None
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%d")
+
+
+def _expiry_from_trdsym(trd_sym: str, underlying: str) -> str | None:
+    """``CRUDEOIL19NOV2610800CE`` / ``CRUDEOIL19NOV26FUT`` → ``2026-11-19``."""
+    if not trd_sym.upper().startswith(underlying):
+        return None
+    return _parse_expiry_from_ref(trd_sym, underlying)
+
+
+def _scaled_strike(raw: str) -> int | float | None:
+    """``dStrikePrice;`` is ×100 and may be in scientific notation (``1.54e+07``)."""
+    try:
+        val = round(float(raw) / 100, 2)
+    except (TypeError, ValueError):
+        return None
+    if val <= 0:
+        return None
+    return int(val) if val == int(val) else val
+
+
+def _row_expiry(row: dict[str, str], underlying: str) -> str | None:
+    """Expiry from ``pExpiryDate`` epoch, cross-checked against ``pTrdSymbol``.
+
+    MCX rows have an empty ``pScripRefKey``, so the epoch is the primary
+    source. A disagreement with the date embedded in the trading symbol means
+    we cannot be sure which is right — the row is rejected.
+    """
+    trd_sym = row.get("pTrdSymbol", "")
+    from_epoch = _epoch_to_date(row.get("pExpiryDate", ""))
+    from_sym = _expiry_from_trdsym(trd_sym, underlying)
+    if from_epoch is None or from_epoch != from_sym:
+        logger.error(
+            "scrip_master.expiry_mismatch",
+            underlying=underlying, trading_symbol=trd_sym,
+            epoch_date=from_epoch, symbol_date=from_sym,
+        )
+        return None
+    return from_epoch
+
+
+def _to_float(raw: str, default: float = 0.0) -> float:
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_futures_underlying_rows(
+    rows: list[dict[str, str]],
+    result: ScripMasterResult,
+    im: InstrumentMaster,
+    today_str: str,
+) -> None:
+    """Parse options-on-futures (MCX) rows.
+
+    Each OPTFUT row's ``pAssetCode`` is the ``pSymbol`` of the FUTCOM contract
+    it devolves into. An option expiry is kept only if that future exists, has
+    the same symbol, expires on/after the option, and every row in the expiry
+    agrees on the future and contract specs. Anything else drops the expiry —
+    a missing chain is safer than a mislabelled one.
+    """
+    # Pass 1: futures, keyed by token
+    futures: dict[str, dict[str, str]] = {}
+    for row in rows:
+        underlying = row.get("pSymbolName", "").upper()
+        cfg = im.get(underlying)
+        if cfg is None or row.get("pInstType") != cfg.future_instrument_type:
+            continue
+        token = row.get("pSymbol", "")
+        expiry = _row_expiry(row, underlying)
+        if not token or not expiry or expiry < today_str:
+            continue
+        futures[token] = {
+            "underlying": underlying,
+            "token": token,
+            "tradingSymbol": row.get("pTrdSymbol", ""),
+            "expiry": expiry,
+            "symbol": f"{underlying} {expiry.replace('-', '')[2:]} FUT",
+        }
+
+    # Pass 2: options
+    option_futures: dict[tuple[str, str], set[str]] = defaultdict(set)
+    option_meta: dict[tuple[str, str], set[tuple]] = defaultdict(set)
+    bad: set[tuple[str, str]] = set()
+    parsed: list[tuple[str, str, str, str, int | float, str, str]] = []
+
+    for row in rows:
+        underlying = row.get("pSymbolName", "").upper()
+        cfg = im.get(underlying)
+        if cfg is None or row.get("pInstType") != cfg.instrument_type:
+            continue
+        token = row.get("pSymbol", "")
+        option_type = row.get("pOptionType", "")
+        trd_sym = row.get("pTrdSymbol", "")
+        if not token or option_type not in ("CE", "PE"):
+            continue
+        expiry = _row_expiry(row, underlying)
+        if not expiry or expiry < today_str:
+            continue
+        key = (underlying, expiry)
+        strike = _scaled_strike(row.get("dStrikePrice;", ""))
+        if strike is None:
+            logger.error("scrip_master.bad_strike", trading_symbol=trd_sym,
+                         raw=row.get("dStrikePrice;", ""))
+            bad.add(key)
+            continue
+
+        asset = row.get("pAssetCode", "")
+        fut = futures.get(asset)
+        if fut is None or fut["underlying"] != underlying or fut["expiry"] < expiry:
+            logger.error(
+                "scrip_master.option_future_invalid",
+                trading_symbol=trd_sym, asset_code=asset,
+                future=fut and fut["tradingSymbol"],
+            )
+            bad.add(key)
+            continue
+        option_futures[key].add(asset)
+
+        lot = int(_to_float(row.get("lLotSize", "")))
+        gen_num = _to_float(row.get("dGenNum", ""), 1.0) or 1.0
+        gen_den = _to_float(row.get("dGenDen", ""), 1.0) or 1.0
+        max_lots = int(_to_float(row.get("iMaxOrderSize", "")))
+        tick = _to_float(row.get("dTickSize", "")) / 100
+        option_meta[key].add((lot, lot * gen_num / gen_den, max_lots * lot, tick))
+
+        parsed.append((underlying, expiry, token, option_type, strike, trd_sym, asset))
+
+    for key, assets in option_futures.items():
+        if len(assets) != 1:
+            logger.error("scrip_master.multiple_underlying_futures",
+                         underlying=key[0], expiry=key[1], assets=sorted(assets))
+            bad.add(key)
+    for key, metas in option_meta.items():
+        if len(metas) != 1:
+            logger.error("scrip_master.inconsistent_contract_meta",
+                         underlying=key[0], expiry=key[1], meta=sorted(metas))
+            bad.add(key)
+
+    for underlying, expiry, token, option_type, strike, trd_sym, asset in parsed:
+        key = (underlying, expiry)
+        if key in bad:
+            continue
+        cfg = im.get(underlying)
+        assert cfg is not None
+        fut = futures[asset]
+        field = f"{strike}:{option_type}"
+
+        if trd_sym:
+            result.trading_symbols[underlying][expiry][field] = trd_sym
+            result.trdsym_to_token[trd_sym] = token
+        result.scrip_tokens[underlying][expiry][field] = token
+        result.tokens[underlying][expiry].append(f"{cfg.segment}|{token}")
+        result.token_segment[token] = cfg.segment
+        result.token_to_symbol[token] = (
+            f"{underlying} {expiry.replace('-', '')[2:]} {strike} {option_type}"
+        )
+
+        if expiry not in result.underlying_future[underlying]:
+            result.underlying_future[underlying][expiry] = {
+                "token": fut["token"],
+                "tradingSymbol": fut["tradingSymbol"],
+                "expiry": fut["expiry"],
+                "symbol": fut["symbol"],
+            }
+            # The chain subscription pulls its own underlying future
+            result.tokens[underlying][expiry].append(f"{cfg.segment}|{fut['token']}")
+            result.token_segment[fut["token"]] = cfg.segment
+            result.token_to_symbol[fut["token"]] = fut["symbol"]
+            if fut["tradingSymbol"]:
+                result.trdsym_to_token[fut["tradingSymbol"]] = fut["token"]
+
+            lot, mult, max_qty, tick = next(iter(option_meta[key]))
+            result.contract_meta[underlying][expiry] = {
+                "lotSize": lot,
+                "pnlMultiplier": mult,
+                "maxOrderQty": max_qty,
+                "tickSize": round(tick, 4),
+            }
+            if (
+                lot != cfg.lot_size
+                or mult != cfg.effective_pnl_multiplier
+                or max_qty != cfg.freeze_quantity
+            ):
+                # Scrip master is authoritative; a mismatch means the exchange
+                # revised the contract and instruments.json is stale.
+                logger.error(
+                    "scrip_master.contract_spec_changed",
+                    underlying=underlying, expiry=expiry,
+                    csv_lot=lot, config_lot=cfg.lot_size,
+                    csv_multiplier=mult, config_multiplier=cfg.effective_pnl_multiplier,
+                    csv_max_order_qty=max_qty, config_freeze_qty=cfg.freeze_quantity,
+                )
+
+    if bad:
+        logger.warning("scrip_master.expiries_dropped",
+                       dropped=sorted(f"{u}:{e}" for u, e in bad))
+
+
 async def _cache_scrip_data(redis_url: str, result: ScripMasterResult) -> None:
     """Store expiry dates and trading symbols per underlying in Redis."""
+    updated_at = datetime.now(timezone.utc).date().isoformat()
+
     async with get_redis(redis_url) as client:
         pipe = client.pipeline()
         for underlying, expiries in result.expiries.items():
@@ -311,11 +556,37 @@ async def _cache_scrip_data(redis_url: str, result: ScripMasterResult) -> None:
                     pipe.hset(key, mapping=tok_map)
                     pipe.expire(key, 86400)  # 24h TTL
 
+        # Futures-underlying: option expiry → underlying future contract
+        for underlying, fut_map in result.underlying_future.items():
+            key = f"{REDIS_KEY_UNDERLYING_FUTURE}:{underlying}"
+            pipe.delete(key)
+            if fut_map:
+                pipe.hset(key, mapping={e: json.dumps(f) for e, f in fut_map.items()})
+                pipe.expire(key, 86400)
+
+        # Per-expiry contract specs from the scrip master (lot, multiplier, max qty)
+        for underlying, meta_map in result.contract_meta.items():
+            key = f"{REDIS_KEY_CONTRACT_META}:{underlying}"
+            pipe.delete(key)
+            if meta_map:
+                pipe.hset(key, mapping={e: json.dumps(m) for e, m in meta_map.items()})
+                pipe.expire(key, 86400)
+
         # Flat reverse lookup: tradingSymbol → numeric token
         if result.trdsym_to_token:
             pipe.delete("cache:scrip:sym2tok")
             pipe.hset("cache:scrip:sym2tok", mapping=result.trdsym_to_token)
             pipe.expire("cache:scrip:sym2tok", 86400)
+
+        # Bulk expiry cache for fast frontend bootstrap
+        pipe.set(
+            "cache:expiries:all",
+            json.dumps({
+                "lastUpdated": updated_at,
+                "expiriesByUnderlying": result.expiries,
+            }),
+            ex=86400,
+        )
 
         await pipe.execute()
     logger.info(
@@ -327,5 +598,3 @@ async def _cache_scrip_data(redis_url: str, result: ScripMasterResult) -> None:
             for sym_map in expiry_map.values()
         ),
     )
-
-

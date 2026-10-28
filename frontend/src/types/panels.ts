@@ -5,9 +5,13 @@ export type PanelId =
   | "iv-skew"
   | "vol-surface"
   | "positions"
+  | "paper-positions"
   | "order-basket"
+  | "risk-management"
   | "greeks-exposure"
-  | "model-comparison";
+  | "model-comparison"
+  | "mispricing-scanner"
+  | "adjustments";
 
 export const PANEL_IDS: PanelId[] = [
   "option-chain",
@@ -16,8 +20,12 @@ export const PANEL_IDS: PanelId[] = [
   "iv-skew",
   "vol-surface",
   "model-comparison",
+  "mispricing-scanner",
   "positions",
+  "paper-positions",
+  "risk-management",
   "greeks-exposure",
+  "adjustments",
 ];
 
 export const PANEL_TITLES: Record<PanelId, string> = {
@@ -27,7 +35,11 @@ export const PANEL_TITLES: Record<PanelId, string> = {
   "iv-skew": "IV Skew",
   "vol-surface": "Vol Surface",
   "model-comparison": "Model Comparison",
+  "mispricing-scanner": "Mispricing Scanner",
   positions: "Positions",
+  "paper-positions": "Paper Positions",
   "order-basket": "Order Basket",
+  "risk-management": "Risk Management",
   "greeks-exposure": "Greeks Exposure",
+  adjustments: "Adjustments",
 };
